@@ -1,14 +1,26 @@
 import { NestFactory } from '@nestjs/core';
-import { ValidationPipe } from '@nestjs/common';
+import { ValidationPipe, Logger } from '@nestjs/common';
 import { SwaggerModule, DocumentBuilder } from '@nestjs/swagger';
 import { AppModule } from './app.module';
 import { PrismaService } from './prisma/prisma.service';
+import { ConfigService } from '@nestjs/config';
+import { HttpService } from '@nestjs/axios';
 import * as fs from 'fs';
+import * as os from 'os';
 
 async function bootstrap() {
   const app = await NestFactory.create(AppModule, {
     cors: true,
   });
+  
+  const logger = new Logger('Bootstrap');
+  const configService = app.get(ConfigService);
+  
+  // Get application config
+  const port = configService.get<number>('PORT') || 3003;
+  const serviceName = configService.get<string>('SERVICE_NAME') || 'payment-service';
+  const serviceDescription = configService.get<string>('SERVICE_DESCRIPTION') || 'Payment Processing Service';
+  const serviceRegistryUrl = configService.get<string>('SERVICE_REGISTRY_URL');
 
   // Enable global validation
   app.useGlobalPipes(new ValidationPipe({
@@ -35,9 +47,80 @@ async function bootstrap() {
   const prismaService = app.get(PrismaService);
   await prismaService.enableShutdownHooks(app);
 
-  const port = process.env.PORT || 3003;
+  // Start the server
   await app.listen(port);
-  console.log(`Payment service running on port ${port}`);
+  
+  // Register with service registry if configured
+  if (serviceRegistryUrl) {
+    try {
+      const httpService = app.get(HttpService);
+      
+      // Get hostname and IP
+      const hostname = os.hostname();
+      const interfaces = os.networkInterfaces();
+      let ipAddress = '';
+      
+      // Find a suitable IP address (prefer non-internal IPv4)
+      Object.keys(interfaces).forEach((interfaceName) => {
+        const networkInterface = interfaces[interfaceName];
+        if (networkInterface) {
+          networkInterface.forEach((iface) => {
+            if (iface.family === 'IPv4' && !iface.internal) {
+              ipAddress = iface.address;
+            }
+          });
+        }
+      });
+      
+      // If no external IP found, use localhost
+      if (!ipAddress) {
+        ipAddress = '127.0.0.1';
+      }
+      
+      // In Docker, use the container name as the service address
+      const serviceAddress = process.env.NODE_ENV === 'production' ? hostname : ipAddress;
+      
+      // Register service with Consul
+      await httpService.put(`${serviceRegistryUrl}/v1/agent/service/register`, {
+        ID: `${serviceName}-${hostname}`,
+        Name: serviceName,
+        Address: serviceAddress,
+        Port: port,
+        Check: {
+          HTTP: `http://${serviceAddress}:${port}/health`,
+          Interval: '15s',
+          Timeout: '5s',
+        },
+        Tags: ['api', 'payment-service', 'nestjs'],
+        Meta: {
+          Description: serviceDescription,
+        },
+      }).toPromise();
+      
+      logger.log(`Service registered with registry at ${serviceRegistryUrl}`);
+      
+      // Setup deregistration on app shutdown
+      app.enableShutdownHooks();
+      
+      // Handle graceful shutdown
+      process.on('SIGINT', async () => {
+        try {
+          await httpService.put(
+            `${serviceRegistryUrl}/v1/agent/service/deregister/${serviceName}-${hostname}`
+          ).toPromise();
+          logger.log('Service deregistered from registry');
+          process.exit(0);
+        } catch (error) {
+          logger.error('Failed to deregister service', error);
+          process.exit(1);
+        }
+      });
+    } catch (error) {
+      logger.error('Failed to register service with registry', error);
+    }
+  }
+  
+  logger.log(`Payment service running on port ${port}`);
 }
 
 bootstrap(); 

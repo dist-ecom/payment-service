@@ -3,6 +3,7 @@ import { HttpService } from '@nestjs/axios';
 import { ConfigService } from '@nestjs/config';
 import { firstValueFrom } from 'rxjs';
 import { PaymentStatus } from '@prisma/client';
+import { ServiceDiscoveryService } from '../../service-discovery/service-discovery.service';
 
 interface OrderDetails {
   id: string;
@@ -15,43 +16,63 @@ interface OrderDetails {
 @Injectable()
 export class OrderService {
   private readonly logger = new Logger(OrderService.name);
-  private readonly orderServiceUrl: string;
-  private readonly serviceToken: string;
+  private readonly orderServiceUrl: string | undefined;
+  private readonly serviceToken: string | undefined;
 
   constructor(
     private readonly httpService: HttpService,
     private readonly configService: ConfigService,
+    private readonly serviceDiscovery: ServiceDiscoveryService,
   ) {
-    const orderServiceUrl = this.configService.get<string>('ORDER_SERVICE_URL');
-    if (!orderServiceUrl) {
-      this.logger.error('ORDER_SERVICE_URL environment variable is not set');
-      throw new Error('ORDER_SERVICE_URL environment variable is not set');
+    // Initialize with fallback URL from env, will be dynamically updated via service discovery
+    this.orderServiceUrl = this.configService.get<string>('ORDER_SERVICE_URL');
+    this.serviceToken = this.configService.get<string>('SERVICE_TOKEN');
+    
+    if (!this.serviceToken) {
+      this.logger.warn('SERVICE_TOKEN not configured - service-to-service authentication will fail');
     }
-    this.orderServiceUrl = orderServiceUrl;
+  }
 
-    const serviceToken = this.configService.get<string>('SERVICE_TOKEN');
-    if (!serviceToken) {
-      this.logger.error('SERVICE_TOKEN environment variable is not set');
-      throw new Error('SERVICE_TOKEN environment variable is not set');
+  private async getOrderServiceUrl(): Promise<string> {
+    try {
+      return await this.serviceDiscovery.getServiceUrl('order-service');
+    } catch (error) {
+      if (!this.orderServiceUrl) {
+        throw new Error('No order service URL available - both service discovery and fallback URL failed');
+      }
+      this.logger.warn(`Failed to get order service URL from discovery, using fallback: ${error.message}`);
+      return this.orderServiceUrl;
     }
-    this.serviceToken = serviceToken;
   }
 
   async getOrderDetails(orderId: string): Promise<OrderDetails> {
     try {
+      const serviceUrl = await this.getOrderServiceUrl();
+      
+      if (!this.serviceToken) {
+        throw new HttpException(
+          'Service authentication token not configured',
+          HttpStatus.INTERNAL_SERVER_ERROR
+        );
+      }
+      
       const response = await firstValueFrom(
-        this.httpService.get<OrderDetails>(`${this.orderServiceUrl}/orders/${orderId}`, {
-          headers: {
-            Authorization: `Bearer ${this.serviceToken}`,
+        this.httpService.get<OrderDetails>(
+          `${serviceUrl}/orders/${orderId}`,
+          {
+            headers: {
+              Authorization: `Bearer ${this.serviceToken}`,
+            },
           },
-        }),
+        ),
       );
+
       return response.data;
     } catch (error) {
-      this.logger.error(`Error fetching order details: ${error.message}`, error.stack);
+      this.logger.error(`Error getting order details: ${error.message}`, error.stack);
       throw new HttpException(
-        `Order with ID ${orderId} not found or inaccessible`,
-        HttpStatus.NOT_FOUND,
+        `Order with ID ${orderId} not found or service unavailable`,
+        error.response?.status || HttpStatus.INTERNAL_SERVER_ERROR,
       );
     }
   }
@@ -62,12 +83,21 @@ export class OrderService {
     paymentIntentId?: string,
   ): Promise<void> {
     try {
+      const serviceUrl = await this.getOrderServiceUrl();
+      
+      if (!this.serviceToken) {
+        throw new HttpException(
+          'Service authentication token not configured',
+          HttpStatus.INTERNAL_SERVER_ERROR
+        );
+      }
+      
       // Convert our internal payment status to the order service's expected format
       const orderPaymentStatus = this.mapPaymentStatusToOrderPaymentStatus(paymentStatus);
       
       await firstValueFrom(
         this.httpService.patch(
-          `${this.orderServiceUrl}/orders/${orderId}/payment-status`,
+          `${serviceUrl}/orders/${orderId}/payment-status`,
           {
             paymentStatus: orderPaymentStatus,
             paymentIntentId,

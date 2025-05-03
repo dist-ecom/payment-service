@@ -1,16 +1,19 @@
 import { Module } from '@nestjs/common';
 import { HttpModule } from '@nestjs/axios';
-import { PaymentsService } from './payments.service';
+import { ConfigModule } from '@nestjs/config';
+import { PrismaModule } from '../prisma/prisma.module';
 import { PaymentsController } from './payments.controller';
+import { PaymentsService } from './payments.service';
 import { StripeService } from './services/stripe.service';
 import { OrderService } from './services/order.service';
+import { ServiceDiscoveryModule } from '../service-discovery/service-discovery.module';
 
 @Module({
   imports: [
-    HttpModule.register({
-      timeout: 5000,
-      maxRedirects: 5,
-    }),
+    HttpModule,
+    ConfigModule,
+    PrismaModule,
+    ServiceDiscoveryModule,
   ],
   controllers: [PaymentsController],
   providers: [PaymentsService, StripeService, OrderService],

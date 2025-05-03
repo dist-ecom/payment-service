@@ -1,5 +1,6 @@
 import { ApiProperty } from '@nestjs/swagger';
-import { PaymentStatus, PaymentProvider } from '@prisma/client';
+import { PaymentStatus, PaymentProvider, Prisma } from '@prisma/client';
+import { Decimal } from '@prisma/client/runtime/library';
 
 export class Payment {
   @ApiProperty({
@@ -24,7 +25,7 @@ export class Payment {
     description: 'The payment amount',
     example: 99.99,
   })
-  amount: number;
+  amount: number | Decimal;
 
   @ApiProperty({
     description: 'The currency code',
@@ -82,7 +83,7 @@ export class Payment {
     type: 'object',
     required: false,
   })
-  metadata?: Record<string, any>;
+  metadata?: Record<string, any> | Prisma.JsonValue;
 
   @ApiProperty({
     description: 'Error message if payment failed',

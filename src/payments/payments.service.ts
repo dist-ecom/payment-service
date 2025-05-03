@@ -255,12 +255,24 @@ export class PaymentsService {
       throw new NotFoundException(`Payment with intent ID ${paymentIntentId} not found`);
     }
 
+    // Get receipt URL if available - using 'any' type to allow expanded properties
+    let receiptUrl = null;
+    if (paymentIntent.latest_charge && typeof paymentIntent.latest_charge !== 'string') {
+      receiptUrl = paymentIntent.latest_charge.receipt_url;
+    } else if (
+      paymentIntent.charges && 
+      paymentIntent.charges.data && 
+      paymentIntent.charges.data.length > 0
+    ) {
+      receiptUrl = paymentIntent.charges.data[0].receipt_url;
+    }
+
     // Update payment status
     await this.prisma.payment.update({
       where: { id: payment.id },
       data: {
         status: PaymentStatus.SUCCEEDED,
-        receiptUrl: paymentIntent.charges?.data?.[0]?.receipt_url,
+        receiptUrl,
       },
     });
 
@@ -317,18 +329,31 @@ export class PaymentsService {
     // If using Stripe, check the payment status with Stripe
     if (payment.provider === PaymentProvider.STRIPE && payment.paymentIntentId) {
       try {
-        const paymentIntent = await this.stripeService.retrievePaymentIntent(payment.paymentIntentId);
+        // We use 'any' type here because the Stripe types don't include expanded properties
+        const paymentIntent = await this.stripeService.retrievePaymentIntent(payment.paymentIntentId) as any;
         
         // Map Stripe status to our status
         const status = this.stripeService.mapStripeStatusToPaymentStatus(paymentIntent.status);
         
         // If status has changed, update it
         if (status !== payment.status) {
+          // Get receipt URL if available - using 'any' type to allow expanded properties
+          let receiptUrl = null;
+          if (paymentIntent.latest_charge && typeof paymentIntent.latest_charge !== 'string') {
+            receiptUrl = paymentIntent.latest_charge.receipt_url;
+          } else if (
+            paymentIntent.charges && 
+            paymentIntent.charges.data && 
+            paymentIntent.charges.data.length > 0
+          ) {
+            receiptUrl = paymentIntent.charges.data[0].receipt_url;
+          }
+
           const updatedPayment = await this.prisma.payment.update({
             where: { id: paymentId },
             data: {
               status,
-              receiptUrl: paymentIntent.charges?.data?.[0]?.receipt_url,
+              receiptUrl,
               errorMessage: paymentIntent.last_payment_error?.message,
             },
           });

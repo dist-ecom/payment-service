@@ -196,7 +196,9 @@ export class PaymentsController {
     
     responseDto.id = payment.id;
     responseDto.orderId = payment.orderId;
-    responseDto.amount = Number(payment.amount);
+    responseDto.amount = typeof payment.amount === 'number' 
+      ? payment.amount 
+      : Number(payment.amount);
     responseDto.currency = payment.currency;
     responseDto.status = payment.status;
     responseDto.provider = payment.provider;

@@ -13,11 +13,13 @@ export class PrismaService extends PrismaClient implements OnModuleInit {
       ],
     });
 
-    this.$on('error', (event) => {
+    // @ts-expect-error - Prisma Client doesn't export these event types correctly
+    this.$on('error', (event: { message: string; target: string }) => {
       this.logger.error(`Prisma error: ${event.message}`, event.target);
     });
 
-    this.$on('warn', (event) => {
+    // @ts-expect-error - Prisma Client doesn't export these event types correctly
+    this.$on('warn', (event: { message: string; target: string }) => {
       this.logger.warn(`Prisma warning: ${event.message}`, event.target);
     });
   }
@@ -28,6 +30,7 @@ export class PrismaService extends PrismaClient implements OnModuleInit {
   }
 
   async enableShutdownHooks(app: INestApplication) {
+    // @ts-expect-error - Prisma Client doesn't export these event types correctly
     this.$on('beforeExit', async () => {
       await app.close();
     });

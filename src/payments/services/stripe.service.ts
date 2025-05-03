@@ -11,7 +11,7 @@ export class StripeService {
   constructor(private configService: ConfigService) {
     const apiKey = this.configService.get<string>('STRIPE_SECRET_KEY');
     this.stripe = new Stripe(apiKey, {
-      apiVersion: '2023-10-16', // Update to the latest version as needed
+      apiVersion: '2023-08-16', // Match the expected type in Stripe's type definition
     });
   }
 
@@ -45,7 +45,10 @@ export class StripeService {
 
   async retrievePaymentIntent(paymentIntentId: string): Promise<Stripe.PaymentIntent> {
     try {
-      return await this.stripe.paymentIntents.retrieve(paymentIntentId);
+      // Expand charges to get receipt URLs and other charge details
+      return await this.stripe.paymentIntents.retrieve(paymentIntentId, {
+        expand: ['charges.data', 'latest_charge'],
+      });
     } catch (error) {
       this.logger.error(`Error retrieving payment intent: ${error.message}`, error.stack);
       throw error;

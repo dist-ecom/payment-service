@@ -22,8 +22,19 @@ export class OrderService {
     private readonly httpService: HttpService,
     private readonly configService: ConfigService,
   ) {
-    this.orderServiceUrl = this.configService.get<string>('ORDER_SERVICE_URL');
-    this.serviceToken = this.configService.get<string>('SERVICE_TOKEN');
+    const orderServiceUrl = this.configService.get<string>('ORDER_SERVICE_URL');
+    if (!orderServiceUrl) {
+      this.logger.error('ORDER_SERVICE_URL environment variable is not set');
+      throw new Error('ORDER_SERVICE_URL environment variable is not set');
+    }
+    this.orderServiceUrl = orderServiceUrl;
+
+    const serviceToken = this.configService.get<string>('SERVICE_TOKEN');
+    if (!serviceToken) {
+      this.logger.error('SERVICE_TOKEN environment variable is not set');
+      throw new Error('SERVICE_TOKEN environment variable is not set');
+    }
+    this.serviceToken = serviceToken;
   }
 
   async getOrderDetails(orderId: string): Promise<OrderDetails> {
@@ -51,11 +62,14 @@ export class OrderService {
     paymentIntentId?: string,
   ): Promise<void> {
     try {
+      // Convert our internal payment status to the order service's expected format
+      const orderPaymentStatus = this.mapPaymentStatusToOrderPaymentStatus(paymentStatus);
+      
       await firstValueFrom(
         this.httpService.patch(
           `${this.orderServiceUrl}/orders/${orderId}/payment-status`,
           {
-            paymentStatus,
+            paymentStatus: orderPaymentStatus,
             paymentIntentId,
           },
           {
@@ -75,20 +89,21 @@ export class OrderService {
   }
 
   // Map our payment service statuses to the order service payment statuses
+  // Order service uses PaymentStatus enum: PENDING, PAID, COMPLETED, FAILED, REFUNDED
   mapPaymentStatusToOrderPaymentStatus(status: PaymentStatus): string {
     switch (status) {
       case PaymentStatus.PENDING:
         return 'pending';
       case PaymentStatus.PROCESSING:
-        return 'pending';
+        return 'pending'; // Order service considers processing as still pending
       case PaymentStatus.SUCCEEDED:
-        return 'completed';
+        return 'completed'; // Map SUCCEEDED to COMPLETED in order service
       case PaymentStatus.FAILED:
         return 'failed';
       case PaymentStatus.REFUNDED:
         return 'refunded';
       case PaymentStatus.CANCELLED:
-        return 'failed';
+        return 'failed'; // Map CANCELLED to FAILED in order service
       default:
         return 'pending';
     }

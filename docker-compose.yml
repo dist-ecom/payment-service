@@ -1,0 +1,54 @@
+version: '3.8'
+
+services:
+  payment-service:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: payment-service
+    restart: always
+    ports:
+      - "3003:3003"
+    env_file:
+      - .env
+    depends_on:
+      - payment-db
+    networks:
+      - payment-network
+      - ecom-network
+
+  payment-db:
+    image: postgres:15
+    container_name: payment-db
+    restart: always
+    ports:
+      - "5434:5432"
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: payment_service
+    volumes:
+      - payment-db-data:/var/lib/postgresql/data
+    networks:
+      - payment-network
+
+  # Tool for PostgreSQL database management
+  payment-adminer:
+    image: adminer
+    container_name: payment-adminer
+    restart: always
+    ports:
+      - "8084:8080"
+    networks:
+      - payment-network
+    depends_on:
+      - payment-db
+
+volumes:
+  payment-db-data:
+
+networks:
+  payment-network:
+    driver: bridge
+  ecom-network:
+    external: true  # This network should be created separately to connect all services 

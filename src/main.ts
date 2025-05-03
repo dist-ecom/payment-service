@@ -62,9 +62,9 @@ async function bootstrap() {
   // Save Swagger JSON to file for external documentation
   fs.writeFileSync('./api-docs.json', JSON.stringify(document, null, 2));
 
-  // Enable Prisma shutdown hooks
+  // Enable Prisma shutdown hooks (updated to use new method)
   const prismaService = app.get(PrismaService);
-  await prismaService.enableShutdownHooks(app);
+  prismaService.setupShutdownHooks(app);
 
   // Start the server
   await app.listen(port);
@@ -82,7 +82,7 @@ async function bootstrap() {
       // Find a suitable IP address (prefer non-internal IPv4)
       Object.keys(interfaces).forEach((interfaceName) => {
         const networkInterface = interfaces[interfaceName];
-        if (networkInterface) {
+        if (networkInterface !== undefined) {
           networkInterface.forEach((iface) => {
             if (iface.family === 'IPv4' && !iface.internal) {
               ipAddress = iface.address;

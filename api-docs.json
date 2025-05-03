@@ -1,0 +1,531 @@
+{
+  "openapi": "3.0.0",
+  "paths": {
+    "/payments": {
+      "post": {
+        "operationId": "PaymentsController_create",
+        "summary": "Create a new payment",
+        "parameters": [],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreatePaymentDto"
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "The payment has been successfully created",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PaymentResponseDto"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Bad request"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "409": {
+            "description": "Payment already exists for this order"
+          }
+        },
+        "tags": [
+          "payments"
+        ],
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      },
+      "get": {
+        "operationId": "PaymentsController_findAll",
+        "summary": "Get all payments for the authenticated user",
+        "parameters": [],
+        "responses": {
+          "200": {
+            "description": "Returns all payments",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/PaymentResponseDto"
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized"
+          }
+        },
+        "tags": [
+          "payments"
+        ],
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
+    "/payments/{id}": {
+      "get": {
+        "operationId": "PaymentsController_findOne",
+        "summary": "Get a payment by ID",
+        "parameters": [
+          {
+            "name": "id",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Returns the payment",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PaymentResponseDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "404": {
+            "description": "Payment not found"
+          }
+        },
+        "tags": [
+          "payments"
+        ],
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
+    "/payments/by-order/{orderId}": {
+      "get": {
+        "operationId": "PaymentsController_findByOrder",
+        "summary": "Get a payment by order ID",
+        "parameters": [
+          {
+            "name": "orderId",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Returns the payment for the order",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PaymentResponseDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "404": {
+            "description": "Payment not found"
+          }
+        },
+        "tags": [
+          "payments"
+        ],
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
+    "/payments/{id}/cancel": {
+      "delete": {
+        "operationId": "PaymentsController_cancel",
+        "summary": "Cancel a payment",
+        "parameters": [
+          {
+            "name": "id",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Payment cancelled successfully",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PaymentResponseDto"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Cannot cancel payment in current state"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "404": {
+            "description": "Payment not found"
+          }
+        },
+        "tags": [
+          "payments"
+        ],
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
+    "/payments/{id}/refund": {
+      "post": {
+        "operationId": "PaymentsController_refund",
+        "summary": "Refund a payment",
+        "parameters": [
+          {
+            "name": "id",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Payment refunded successfully",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PaymentResponseDto"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Cannot refund payment in current state"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "404": {
+            "description": "Payment not found"
+          }
+        },
+        "tags": [
+          "payments"
+        ],
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
+    "/payments/webhook": {
+      "post": {
+        "operationId": "PaymentsController_handleWebhook",
+        "summary": "Handle payment provider webhooks",
+        "parameters": [
+          {
+            "name": "stripe-signature",
+            "required": true,
+            "in": "header",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/WebhookEventDto"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Webhook processed successfully"
+          }
+        },
+        "tags": [
+          "payments"
+        ]
+      }
+    },
+    "/payments/{id}/status": {
+      "get": {
+        "operationId": "PaymentsController_checkStatus",
+        "summary": "Check the current status of a payment",
+        "parameters": [
+          {
+            "name": "id",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Returns the current payment status",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PaymentResponseDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "404": {
+            "description": "Payment not found"
+          }
+        },
+        "tags": [
+          "payments"
+        ],
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
+    "/health": {
+      "get": {
+        "operationId": "HealthController_check",
+        "parameters": [],
+        "responses": {
+          "200": {
+            "description": "Health check passed"
+          },
+          "503": {
+            "description": "Service unavailable"
+          }
+        },
+        "tags": [
+          "health"
+        ]
+      }
+    }
+  },
+  "info": {
+    "title": "Payment Service API",
+    "description": "API documentation for the Payment Service",
+    "version": "1.0",
+    "contact": {}
+  },
+  "tags": [],
+  "servers": [],
+  "components": {
+    "securitySchemes": {
+      "bearer": {
+        "scheme": "bearer",
+        "bearerFormat": "JWT",
+        "type": "http"
+      }
+    },
+    "schemas": {
+      "CreatePaymentDto": {
+        "type": "object",
+        "properties": {
+          "orderId": {
+            "type": "string",
+            "description": "The ID of the order to pay for",
+            "example": "123e4567-e89b-12d3-a456-426614174001"
+          },
+          "amount": {
+            "type": "number",
+            "description": "The payment amount",
+            "example": 99.99
+          },
+          "currency": {
+            "type": "string",
+            "description": "The currency code",
+            "example": "USD",
+            "default": "USD"
+          },
+          "paymentMethod": {
+            "type": "string",
+            "description": "The payment method type",
+            "example": "card"
+          },
+          "provider": {
+            "type": "string",
+            "description": "Payment provider",
+            "enum": [
+              "STRIPE",
+              "MOCK"
+            ],
+            "default": "STRIPE"
+          },
+          "description": {
+            "type": "string",
+            "description": "Description of what the payment is for",
+            "example": "Payment for order #12345"
+          },
+          "metadata": {
+            "type": "object",
+            "description": "Additional metadata for the payment",
+            "example": {
+              "customerNote": "Priority shipping"
+            }
+          }
+        },
+        "required": [
+          "orderId",
+          "amount",
+          "currency",
+          "paymentMethod",
+          "provider"
+        ]
+      },
+      "PaymentResponseDto": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "description": "The unique identifier of the payment",
+            "example": "123e4567-e89b-12d3-a456-426614174000"
+          },
+          "orderId": {
+            "type": "string",
+            "description": "The ID of the order this payment is for",
+            "example": "123e4567-e89b-12d3-a456-426614174001"
+          },
+          "amount": {
+            "type": "number",
+            "description": "The payment amount",
+            "example": 99.99
+          },
+          "currency": {
+            "type": "string",
+            "description": "The currency code",
+            "example": "USD"
+          },
+          "status": {
+            "type": "string",
+            "description": "The current status of the payment",
+            "enum": [
+              "PENDING",
+              "PROCESSING",
+              "SUCCEEDED",
+              "FAILED",
+              "REFUNDED",
+              "CANCELLED"
+            ],
+            "example": "PENDING"
+          },
+          "provider": {
+            "type": "string",
+            "description": "The payment provider",
+            "enum": [
+              "STRIPE",
+              "MOCK"
+            ],
+            "example": "STRIPE"
+          },
+          "paymentMethod": {
+            "type": "string",
+            "description": "The payment method used",
+            "example": "card"
+          },
+          "clientSecret": {
+            "type": "string",
+            "description": "Client secret for client-side confirmation (only included for pending payments)"
+          },
+          "receiptUrl": {
+            "type": "string",
+            "description": "URL to the payment receipt (only included for successful payments)"
+          },
+          "errorMessage": {
+            "type": "string",
+            "description": "Error message if payment failed"
+          },
+          "createdAt": {
+            "format": "date-time",
+            "type": "string",
+            "description": "Creation timestamp"
+          },
+          "updatedAt": {
+            "format": "date-time",
+            "type": "string",
+            "description": "Last update timestamp"
+          }
+        },
+        "required": [
+          "id",
+          "orderId",
+          "amount",
+          "currency",
+          "status",
+          "provider",
+          "paymentMethod",
+          "createdAt",
+          "updatedAt"
+        ]
+      },
+      "WebhookEventDto": {
+        "type": "object",
+        "properties": {
+          "type": {
+            "type": "string",
+            "description": "The type of event",
+            "example": "payment_intent.succeeded"
+          },
+          "id": {
+            "type": "string",
+            "description": "The unique identifier for the event",
+            "example": "evt_1NjWhHJD4qksNs9kJnwXaZ8P"
+          },
+          "data": {
+            "type": "object",
+            "description": "The event payload"
+          }
+        },
+        "required": [
+          "type",
+          "id",
+          "data"
+        ]
+      }
+    }
+  }
+}

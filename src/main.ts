@@ -6,6 +6,7 @@ import { AppModule } from './app.module';
 import { PrismaService } from './prisma/prisma.service';
 import { ConfigService } from '@nestjs/config';
 import { HttpService } from '@nestjs/axios';
+import { firstValueFrom } from 'rxjs';
 import * as fs from 'fs';
 import * as os from 'os';
 
@@ -96,27 +97,51 @@ async function bootstrap() {
         ipAddress = '127.0.0.1';
       }
       
-      // In Docker, use the container name as the service address
+      // Use IP address for local development, hostname for production
       const serviceAddress = process.env.NODE_ENV === 'production' ? hostname : ipAddress;
       
-      // Register service with Consul
-      await httpService.put(`${serviceRegistryUrl}/v1/agent/service/register`, {
-        ID: `${serviceName}-${hostname}`,
+      // Create service ID (same format that worked in our test)
+      const serviceId = `${serviceName}-${hostname}-${port}`;
+      
+      // Simple Consul registration payload - exact format from successful test
+      const consulRegistration = {
+        ID: serviceId,
         Name: serviceName,
         Address: serviceAddress,
-        Port: port,
+        Port: Number(port),
         Check: {
           HTTP: `http://${serviceAddress}:${port}/health`,
-          Interval: '15s',
-          Timeout: '5s',
-        },
-        Tags: ['api', 'payment-service', 'nestjs'],
-        Meta: {
-          Description: serviceDescription,
-        },
-      }).toPromise();
+          Interval: '15s'
+        }
+      };
       
-      logger.log(`Service registered with registry at ${serviceRegistryUrl}`);
+      logger.log(`Registering service with Consul at: ${serviceRegistryUrl}`);
+      logger.log(`Using service ID: ${serviceId}`);
+      logger.log(`Address: ${serviceAddress}, Port: ${port}`);
+      
+      try {
+        // First verify Consul is reachable
+        const statusResponse = await firstValueFrom(
+          httpService.get(`${serviceRegistryUrl}/v1/status/leader`)
+        );
+        logger.log(`Consul status check OK: ${statusResponse.status}`);
+        
+        // Then register service
+        const response = await firstValueFrom(
+          httpService.put(`${serviceRegistryUrl}/v1/agent/service/register`, consulRegistration)
+        );
+        
+        logger.log(`Service registered successfully with status: ${response.status}`);
+      } catch (regError: any) {
+        logger.error(`Consul error: ${regError.message}`);
+        if (regError.response) {
+          logger.error(`Status: ${regError.response.status}`);
+          logger.error(`Data: ${JSON.stringify(regError.response.data || {})}`);
+        } else if (regError.request) {
+          logger.error('No response from Consul - service may not be running');
+        }
+        throw regError;
+      }
       
       // Setup deregistration on app shutdown
       app.enableShutdownHooks();
@@ -124,18 +149,19 @@ async function bootstrap() {
       // Handle graceful shutdown
       process.on('SIGINT', async () => {
         try {
-          await httpService.put(
-            `${serviceRegistryUrl}/v1/agent/service/deregister/${serviceName}-${hostname}`
-          ).toPromise();
-          logger.log('Service deregistered from registry');
+          logger.log(`Deregistering service with ID: ${serviceId}`);
+          await firstValueFrom(
+            httpService.put(`${serviceRegistryUrl}/v1/agent/service/deregister/${serviceId}`)
+          );
+          logger.log('Service deregistered from Consul');
           process.exit(0);
-        } catch (error) {
-          logger.error('Failed to deregister service', error);
+        } catch (error: any) {
+          logger.error(`Failed to deregister service: ${error.message}`);
           process.exit(1);
         }
       });
-    } catch (error) {
-      logger.error('Failed to register service with registry', error);
+    } catch (error: any) {
+      logger.error(`Consul registration failed: ${error.message}`);
     }
   }
   

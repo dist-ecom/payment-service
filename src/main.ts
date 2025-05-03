@@ -1,6 +1,7 @@
 import { NestFactory } from '@nestjs/core';
 import { ValidationPipe, Logger } from '@nestjs/common';
 import { SwaggerModule, DocumentBuilder } from '@nestjs/swagger';
+import { MicroserviceOptions, Transport } from '@nestjs/microservices';
 import { AppModule } from './app.module';
 import { PrismaService } from './prisma/prisma.service';
 import { ConfigService } from '@nestjs/config';
@@ -21,6 +22,24 @@ async function bootstrap() {
   const serviceName = configService.get<string>('SERVICE_NAME') || 'payment-service';
   const serviceDescription = configService.get<string>('SERVICE_DESCRIPTION') || 'Payment Processing Service';
   const serviceRegistryUrl = configService.get<string>('SERVICE_REGISTRY_URL');
+  const rabbitmqUrl = configService.get<string>('RABBITMQ_URL') || 'amqp://localhost:5672';
+  
+  // Connect to RabbitMQ
+  app.connectMicroservice<MicroserviceOptions>({
+    transport: Transport.RMQ,
+    options: {
+      urls: [rabbitmqUrl],
+      queue: 'payments_queue',
+      queueOptions: {
+        durable: true,
+      },
+      noAck: false,
+    },
+  });
+
+  // Start microservices
+  await app.startAllMicroservices();
+  logger.log('Microservice is listening');
 
   // Enable global validation
   app.useGlobalPipes(new ValidationPipe({

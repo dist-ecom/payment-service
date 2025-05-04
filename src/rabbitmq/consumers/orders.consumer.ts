@@ -1,17 +1,19 @@
-import { Injectable, Logger, Inject, forwardRef } from '@nestjs/common';
+import { Injectable, Logger, Inject, forwardRef, OnModuleInit } from '@nestjs/common';
 import { RmqContext, Ctx, Payload, EventPattern } from '@nestjs/microservices';
 import { PaymentsService } from '../../payments/payments.service';
 import { PaymentStatus, PaymentProvider } from '@prisma/client';
 
 @Injectable()
-export class OrdersConsumer {
+export class OrdersConsumer implements OnModuleInit {
   private readonly logger = new Logger(OrdersConsumer.name);
 
   constructor(
     @Inject(forwardRef(() => PaymentsService))
     private readonly paymentsService: PaymentsService
-  ) {
-    this.logger.log('OrdersConsumer initialized');
+  ) {}
+
+  onModuleInit() {
+    this.logger.log('OrdersConsumer initialized and listening for order events');
   }
 
   @EventPattern('order.created')
@@ -38,7 +40,7 @@ export class OrdersConsumer {
       // Create a payment for the order with pending status
       await this.paymentsService.createPayment({
         orderId: order.id,
-        amount: order.totalAmount,
+        amount: parseFloat(order.totalAmount) || 0,
         paymentMethod: order.paymentMethod || 'card',
         currency: order.currency || 'USD',
         description: `Payment for order ${order.id}`,

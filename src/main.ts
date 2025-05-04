@@ -36,6 +36,17 @@ async function bootstrap() {
         durable: true,
       },
       noAck: false,
+      prefetchCount: 1,
+      deserializer: {
+        deserialize: (value) => {
+          try {
+            return JSON.parse(value.toString());
+          } catch (e) {
+            logger.error(`Failed to deserialize message: ${e.message}`);
+            return value.toString();
+          }
+        }
+      },
     },
   });
 

@@ -15,6 +15,21 @@ import { PaymentsModule } from '../payments/payments.module';
           transport: Transport.RMQ,
           options: {
             urls: [configService.get<string>('RABBITMQ_URL') || 'amqp://localhost:5672'],
+            queue: 'payments_queue',
+            queueOptions: {
+              durable: true,
+            },
+          },
+        }),
+        inject: [ConfigService],
+      },
+      {
+        name: 'ORDERS_RABBITMQ_CLIENT',
+        imports: [ConfigModule],
+        useFactory: (configService: ConfigService) => ({
+          transport: Transport.RMQ,
+          options: {
+            urls: [configService.get<string>('RABBITMQ_URL') || 'amqp://localhost:5672'],
             queue: 'orders_queue',
             queueOptions: {
               durable: true,

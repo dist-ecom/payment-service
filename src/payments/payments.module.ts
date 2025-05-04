@@ -1,4 +1,4 @@
-import { Module } from '@nestjs/common';
+import { Module, forwardRef } from '@nestjs/common';
 import { HttpModule } from '@nestjs/axios';
 import { ConfigModule } from '@nestjs/config';
 import { PrismaModule } from '../prisma/prisma.module';
@@ -7,6 +7,7 @@ import { PaymentsService } from './payments.service';
 import { StripeService } from './services/stripe.service';
 import { OrderService } from './services/order.service';
 import { ServiceDiscoveryModule } from '../service-discovery/service-discovery.module';
+import { RabbitmqModule } from '../rabbitmq/rabbitmq.module';
 
 @Module({
   imports: [
@@ -14,6 +15,7 @@ import { ServiceDiscoveryModule } from '../service-discovery/service-discovery.m
     ConfigModule,
     PrismaModule,
     ServiceDiscoveryModule,
+    forwardRef(() => RabbitmqModule),
   ],
   controllers: [PaymentsController],
   providers: [PaymentsService, StripeService, OrderService],

@@ -1,10 +1,11 @@
-import { Injectable, Logger, NotFoundException, BadRequestException, ConflictException } from '@nestjs/common';
+import { Injectable, Logger, NotFoundException, BadRequestException, ConflictException, Inject, forwardRef } from '@nestjs/common';
 import { PrismaService } from '../prisma/prisma.service';
 import { CreatePaymentDto } from './dto/create-payment.dto';
 import { PaymentStatus, PaymentProvider, Payment, WebhookEvent, Prisma } from '@prisma/client';
 import { StripeService } from './services/stripe.service';
 import { OrderService } from './services/order.service';
 import { WebhookEventDto } from './dto/payment-webhook.dto';
+import { RabbitmqService } from '../rabbitmq/rabbitmq.service';
 
 @Injectable()
 export class PaymentsService {
@@ -14,6 +15,8 @@ export class PaymentsService {
     private readonly prisma: PrismaService,
     private readonly stripeService: StripeService,
     private readonly orderService: OrderService,
+    @Inject(forwardRef(() => RabbitmqService))
+    private readonly rabbitmqService: RabbitmqService,
   ) {}
 
   async createPayment(createPaymentDto: CreatePaymentDto, userId: string): Promise<Payment> {
@@ -268,7 +271,7 @@ export class PaymentsService {
     }
 
     // Update payment status
-    await this.prisma.payment.update({
+    const updatedPayment = await this.prisma.payment.update({
       where: { id: payment.id },
       data: {
         status: PaymentStatus.SUCCEEDED,
@@ -282,6 +285,11 @@ export class PaymentsService {
       PaymentStatus.SUCCEEDED,
       paymentIntentId,
     );
+
+    // Publish payment.processed event
+    await this.rabbitmqService.publishPaymentProcessed(updatedPayment);
+
+    this.logger.log(`Payment succeeded and event published for order ${payment.orderId}`);
   }
 
   private async handlePaymentFailed(paymentIntent: any): Promise<void> {
@@ -297,7 +305,7 @@ export class PaymentsService {
     }
 
     // Update payment status
-    await this.prisma.payment.update({
+    const updatedPayment = await this.prisma.payment.update({
       where: { id: payment.id },
       data: {
         status: PaymentStatus.FAILED,
@@ -311,6 +319,11 @@ export class PaymentsService {
       PaymentStatus.FAILED,
       paymentIntentId,
     );
+
+    // Publish payment.failed event
+    await this.rabbitmqService.publishPaymentFailed(updatedPayment);
+
+    this.logger.log(`Payment failed and event published for order ${payment.orderId}`);
   }
 
   async checkPaymentStatus(paymentId: string, userId: string): Promise<Payment> {
@@ -365,6 +378,15 @@ export class PaymentsService {
               status,
               payment.paymentIntentId,
             );
+            
+            // Publish appropriate event based on status
+            if (status === PaymentStatus.SUCCEEDED) {
+              await this.rabbitmqService.publishPaymentProcessed(updatedPayment);
+              this.logger.log(`Payment succeeded and event published for order ${payment.orderId}`);
+            } else if (status === PaymentStatus.FAILED) {
+              await this.rabbitmqService.publishPaymentFailed(updatedPayment);
+              this.logger.log(`Payment failed and event published for order ${payment.orderId}`);
+            }
           }
 
           return updatedPayment;

@@ -61,7 +61,11 @@ export class ServiceDiscoveryService {
       
       if (response.data && response.data.length > 0) {
         // Get the first healthy instance
-        const instance = response.data.find(svc => svc.Checks.every(check => check.Status === 'passing'));
+        const instance = response.data.find(svc => 
+          svc.Checks && Array.isArray(svc.Checks) 
+            ? svc.Checks.every(check => check.Status === 'passing')
+            : true  // If no checks, assume it's healthy
+        );
         
         if (instance) {
           const serviceUrl = `http://${instance.ServiceAddress}:${instance.ServicePort}`;

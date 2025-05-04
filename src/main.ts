@@ -13,6 +13,7 @@ import * as os from 'os';
 async function bootstrap() {
   const app = await NestFactory.create(AppModule, {
     cors: true,
+    logger: ['error', 'warn', 'log', 'debug'],
   });
   
   const logger = new Logger('Bootstrap');
@@ -25,8 +26,21 @@ async function bootstrap() {
   const serviceRegistryUrl = configService.get<string>('SERVICE_REGISTRY_URL');
   const rabbitmqUrl = configService.get<string>('RABBITMQ_URL') || 'amqp://localhost:5672';
   
-  // Connect to RabbitMQ
-  app.connectMicroservice<MicroserviceOptions>({
+  // Connect to RabbitMQ for orders events first - this needs to be loaded before payment events
+  const ordersMs = app.connectMicroservice<MicroserviceOptions>({
+    transport: Transport.RMQ,
+    options: {
+      urls: [rabbitmqUrl],
+      queue: 'orders_queue',
+      queueOptions: {
+        durable: true,
+      },
+      noAck: false,
+    },
+  });
+
+  // Connect to RabbitMQ for payment events
+  const paymentsMs = app.connectMicroservice<MicroserviceOptions>({
     transport: Transport.RMQ,
     options: {
       urls: [rabbitmqUrl],
@@ -36,11 +50,12 @@ async function bootstrap() {
       },
       noAck: false,
     },
+
   });
 
   // Start microservices
   await app.startAllMicroservices();
-  logger.log('Microservice is listening');
+  logger.log('Microservice is listening on queues: orders_queue, payments_queue');
 
   // Enable global validation
   app.useGlobalPipes(new ValidationPipe({
@@ -58,7 +73,7 @@ async function bootstrap() {
     .build();
   
   const document = SwaggerModule.createDocument(app, config);
-  SwaggerModule.setup('docs', app, document);
+  SwaggerModule.setup('/api', app, document);
   
   // Save Swagger JSON to file for external documentation
   fs.writeFileSync('./api-docs.json', JSON.stringify(document, null, 2));
@@ -112,7 +127,11 @@ async function bootstrap() {
         Check: {
           HTTP: `http://${serviceAddress}:${port}/health`,
           Interval: '15s'
-        }
+        },
+        Tags: ['api', 'payment-service', 'nestjs'],
+        Meta: {
+          Description: serviceDescription,
+        },
       };
       
       logger.log(`Registering service with Consul at: ${serviceRegistryUrl}`);

@@ -122,8 +122,8 @@
     },
     "/payments/by-order/{orderId}": {
       "get": {
-        "operationId": "PaymentsController_findByOrder",
-        "summary": "Get a payment by order ID",
+        "operationId": "PaymentsController_getByOrderId",
+        "summary": "Get payment by order ID",
         "parameters": [
           {
             "name": "orderId",
@@ -136,7 +136,7 @@
         ],
         "responses": {
           "200": {
-            "description": "Returns the payment for the order",
+            "description": "Payment found",
             "content": {
               "application/json": {
                 "schema": {
@@ -144,9 +144,6 @@
                 }
               }
             }
-          },
-          "401": {
-            "description": "Unauthorized"
           },
           "404": {
             "description": "Payment not found"
@@ -319,6 +316,58 @@
           },
           "401": {
             "description": "Unauthorized"
+          },
+          "404": {
+            "description": "Payment not found"
+          }
+        },
+        "tags": [
+          "payments"
+        ],
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
+    "/payments/{id}/confirm": {
+      "post": {
+        "operationId": "PaymentsController_confirmPayment",
+        "summary": "Confirm an existing payment",
+        "parameters": [
+          {
+            "name": "id",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ConfirmPaymentDto"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Payment confirmed successfully",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PaymentResponseDto"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Bad request"
           },
           "404": {
             "description": "Payment not found"
@@ -530,6 +579,68 @@
           "type",
           "id",
           "data"
+        ]
+      },
+      "CardDetailsDto": {
+        "type": "object",
+        "properties": {
+          "number": {
+            "type": "string",
+            "description": "Card number",
+            "example": "4242424242424242"
+          },
+          "expMonth": {
+            "type": "string",
+            "description": "Expiration month",
+            "example": "12"
+          },
+          "expYear": {
+            "type": "string",
+            "description": "Expiration year",
+            "example": "2025"
+          },
+          "cvc": {
+            "type": "string",
+            "description": "CVC/CVV code",
+            "example": "123"
+          },
+          "name": {
+            "type": "string",
+            "description": "Name on card",
+            "example": "John Doe"
+          }
+        },
+        "required": [
+          "number",
+          "expMonth",
+          "expYear",
+          "cvc",
+          "name"
+        ]
+      },
+      "ConfirmPaymentDto": {
+        "type": "object",
+        "properties": {
+          "paymentMethod": {
+            "type": "string",
+            "description": "Payment method",
+            "example": "card",
+            "enum": [
+              "card"
+            ]
+          },
+          "cardDetails": {
+            "description": "Card details for the payment",
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/CardDetailsDto"
+              }
+            ]
+          }
+        },
+        "required": [
+          "paymentMethod",
+          "cardDetails"
         ]
       }
     }

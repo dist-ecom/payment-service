@@ -1,4 +1,4 @@
-import { Injectable, Logger, NotFoundException, BadRequestException, ConflictException, Inject, forwardRef } from '@nestjs/common';
+import { Injectable, Logger, NotFoundException, BadRequestException, ConflictException, Inject, forwardRef, ForbiddenException, InternalServerErrorException } from '@nestjs/common';
 import { PrismaService } from '../prisma/prisma.service';
 import { CreatePaymentDto } from './dto/create-payment.dto';
 import { PaymentStatus, PaymentProvider, Payment, WebhookEvent, Prisma } from '@prisma/client';
@@ -6,6 +6,8 @@ import { StripeService } from './services/stripe.service';
 import { OrderService } from './services/order.service';
 import { WebhookEventDto } from './dto/payment-webhook.dto';
 import { RabbitmqService } from '../rabbitmq/rabbitmq.service';
+import { ConfigService } from '@nestjs/config';
+import { ConfirmPaymentDto } from './dto/confirm-payment.dto';
 
 @Injectable()
 export class PaymentsService {
@@ -17,78 +19,140 @@ export class PaymentsService {
     private readonly orderService: OrderService,
     @Inject(forwardRef(() => RabbitmqService))
     private readonly rabbitmqService: RabbitmqService,
+    private readonly configService: ConfigService,
   ) {}
 
-  async createPayment(createPaymentDto: CreatePaymentDto, userId: string): Promise<Payment> {
-    // Check if order exists and belongs to the user
-    const order = await this.orderService.getOrderDetails(createPaymentDto.orderId);
+  async createPayment(
+    createPaymentDto: CreatePaymentDto,
+    userId: string,
+  ): Promise<Payment> {
+    this.logger.log(`Creating payment for order ${createPaymentDto.orderId} with amount ${createPaymentDto.amount}`);
     
-    if (order.userId !== userId) {
-      throw new BadRequestException('You do not have permission to pay for this order');
-    }
-
-    // Check if a payment already exists for this order
-    const existingPayment = await this.prisma.payment.findUnique({
-      where: { orderId: createPaymentDto.orderId },
-    });
-
-    if (existingPayment) {
-      // If payment exists but failed or cancelled, we can create a new one
-      if (
-        existingPayment.status !== PaymentStatus.FAILED &&
-        existingPayment.status !== PaymentStatus.CANCELLED
-      ) {
-        throw new ConflictException('A payment already exists for this order');
-      }
-      
-      // Delete the existing payment record before creating a new one
-      await this.prisma.payment.delete({
-        where: { id: existingPayment.id },
-      });
-    }
-
-    // Process based on provider (currently only Stripe is implemented)
-    let paymentIntentId: string;
-    let clientSecret: string;
-
     try {
-      if (createPaymentDto.provider === PaymentProvider.STRIPE) {
-        const result = await this.stripeService.createPaymentIntent(
-          createPaymentDto.amount,
-          createPaymentDto.currency,
-          createPaymentDto.orderId,
-          createPaymentDto.metadata,
-        );
-        
-        paymentIntentId = result.paymentIntentId;
-        clientSecret = result.clientSecret;
-      } else {
-        // Mock provider for local development/testing
-        paymentIntentId = `mock_${Date.now()}`;
-        clientSecret = `mock_secret_${Date.now()}`;
+      // Check if payment already exists for this order
+      const existingPayment = await this.prisma.payment.findFirst({
+        where: { orderId: createPaymentDto.orderId },
+      });
+
+      if (existingPayment) {
+        // Handle different payment statuses
+        if (existingPayment.status === PaymentStatus.PENDING || 
+            existingPayment.status === PaymentStatus.PROCESSING) {
+          // For pending or processing payments, return the existing payment
+          this.logger.log(`Found ${existingPayment.status} payment for order ${createPaymentDto.orderId}. Returning existing payment.`);
+          return existingPayment as unknown as Payment;
+        } else if (existingPayment.status === PaymentStatus.FAILED || 
+                  existingPayment.status === PaymentStatus.CANCELLED) {
+          // For failed or cancelled payments, allow creating a new one
+          this.logger.log(`Found ${existingPayment.status} payment for order ${createPaymentDto.orderId}. Allowing retry.`);
+          
+          // Delete the old payment record
+          await this.prisma.payment.delete({
+            where: { id: existingPayment.id },
+          });
+          
+          this.logger.log(`Deleted previous payment record ${existingPayment.id}`);
+        } else if (existingPayment.status === PaymentStatus.SUCCEEDED) {
+          // If payment was already successful, just return it
+          this.logger.log(`Payment already succeeded for order ${createPaymentDto.orderId}`);
+          return existingPayment as unknown as Payment;
+        } else if (existingPayment.status === PaymentStatus.REFUNDED) {
+          // If payment was refunded, allow creating a new one
+          this.logger.log(`Found REFUNDED payment for order ${createPaymentDto.orderId}. Allowing new payment.`);
+          
+          // Delete the old payment record
+          await this.prisma.payment.delete({
+            where: { id: existingPayment.id },
+          });
+        } else {
+          this.logger.warn(`Payment already exists for order ${createPaymentDto.orderId} with status ${existingPayment.status}`);
+          throw new ConflictException(`Payment already exists for this order with status: ${existingPayment.status}`);
+        }
       }
 
-      // Create payment record in database
+      // Get order details to verify ownership
+      const order = await this.orderService.getOrderDetails(createPaymentDto.orderId);
+      
+      if (!order) {
+        this.logger.error(`Order ${createPaymentDto.orderId} not found`);
+        throw new NotFoundException(`Order ${createPaymentDto.orderId} not found`);
+      }
+
+      if (order.userId !== userId) {
+        this.logger.error(`User ${userId} does not own order ${createPaymentDto.orderId}`);
+        throw new ForbiddenException('You do not have permission to pay for this order');
+      }
+
+      let clientSecret;
+      let paymentIntentId;
+
+      // Check if mock payment is enabled
+      const useMockPayment = this.configService.get<string>('ENABLE_MOCK_PAYMENT') === 'true';
+      this.logger.debug(`Mock payment enabled: ${useMockPayment}`);
+
+      if (useMockPayment) {
+        this.logger.log('Using mock payment processor');
+        // Generate random strings for mock data
+        const randomString = (length: number) => 
+          [...Array(length)].map(() => (~~(Math.random() * 36)).toString(36)).join('');
+        
+        clientSecret = `mock_pi_${Date.now()}_secret_${randomString(24)}`;
+        paymentIntentId = `mock_pi_${Date.now()}_${randomString(16)}`;
+      } else {
+        // Create a payment intent with Stripe
+        this.logger.log('Creating Stripe payment intent');
+        try {
+          const result = await this.stripeService.createPaymentIntent(
+            createPaymentDto.amount,
+            createPaymentDto.currency || 'USD',
+            createPaymentDto.orderId,
+            { userId }
+          );
+          clientSecret = result.clientSecret;
+          paymentIntentId = result.paymentIntentId;
+          this.logger.debug(`Stripe payment intent created: ${paymentIntentId}`);
+        } catch (stripeError) {
+          this.logger.error(`Stripe payment intent creation failed: ${stripeError.message}`, stripeError.stack);
+          throw new BadRequestException(`Payment processing error: ${stripeError.message}`);
+        }
+      }
+
+      // Save the payment record to database
       const payment = await this.prisma.payment.create({
         data: {
           orderId: createPaymentDto.orderId,
-          userId: userId,
+          userId,
           amount: createPaymentDto.amount,
-          currency: createPaymentDto.currency,
+          currency: createPaymentDto.currency || 'USD',
           status: PaymentStatus.PENDING,
-          provider: createPaymentDto.provider,
+          provider: createPaymentDto.provider || PaymentProvider.STRIPE,
           paymentMethod: createPaymentDto.paymentMethod,
-          paymentIntentId: paymentIntentId,
-          clientSecret: clientSecret,
-          description: createPaymentDto.description,
-          metadata: createPaymentDto.metadata as Prisma.JsonObject,
+          description: createPaymentDto.description || `Payment for order ${createPaymentDto.orderId}`,
+          clientSecret,
+          paymentIntentId, // Use the correct field name from the schema
+          metadata: createPaymentDto.metadata || {},
         },
       });
 
+      this.logger.log(`Payment ${payment.id} created successfully for order ${createPaymentDto.orderId}`);
+      
+      // Update order payment status
+      await this.orderService.updatePaymentStatus(
+        createPaymentDto.orderId,
+        PaymentStatus.PENDING,
+        payment.paymentIntentId
+      );
+
       return payment;
     } catch (error) {
-      this.logger.error(`Error creating payment: ${error.message}`, error.stack);
-      throw error;
+      this.logger.error(`Failed to create payment: ${error.message}`, error.stack);
+      if (error instanceof ConflictException || 
+          error instanceof NotFoundException || 
+          error instanceof ForbiddenException ||
+          error instanceof BadRequestException) {
+        throw error;
+      }
+      throw new InternalServerErrorException(`Payment processing failed: ${error.message}`);
     }
   }
 
@@ -527,5 +591,153 @@ export class PaymentsService {
     }
 
     return payment;
+  }
+
+  async findByOrderId(orderId: string, userId: string): Promise<Payment> {
+    this.logger.log(`Finding payment for order ${orderId}`);
+    
+    const payment = await this.prisma.payment.findFirst({
+      where: { 
+        orderId: orderId 
+      },
+    });
+    
+    if (!payment) {
+      this.logger.warn(`Payment not found for order ${orderId}`);
+      throw new NotFoundException(`Payment not found for order ${orderId}`);
+    }
+    
+    // Get order details to verify ownership
+    try {
+      const order = await this.orderService.getOrderDetails(orderId);
+      
+      // Check if user is the owner of the order
+      if (order && order.userId !== userId) {
+        this.logger.warn(`User ${userId} attempted to access payment for order ${orderId} owned by ${order.userId}`);
+        throw new ForbiddenException('You are not authorized to access this payment');
+      }
+    } catch (error) {
+      if (!(error instanceof ForbiddenException)) {
+        this.logger.error(`Error verifying order ownership: ${error.message}`);
+      }
+      throw error;
+    }
+    
+    return payment as unknown as Payment;
+  }
+  
+  async confirmPayment(
+    paymentId: string, 
+    confirmPaymentDto: ConfirmPaymentDto, 
+    userId: string
+  ): Promise<Payment> {
+    this.logger.log(`Confirming payment ${paymentId}`);
+    
+    // Find the payment
+    const payment = await this.prisma.payment.findUnique({
+      where: { id: paymentId },
+    });
+    
+    if (!payment) {
+      this.logger.warn(`Payment ${paymentId} not found`);
+      throw new NotFoundException(`Payment ${paymentId} not found`);
+    }
+    
+    // Get order details to verify ownership
+    try {
+      const order = await this.orderService.getOrderDetails(payment.orderId);
+      
+      // Check if user is the owner of the order
+      if (order && order.userId !== userId) {
+        this.logger.warn(`User ${userId} attempted to confirm payment ${paymentId} for order ${payment.orderId} owned by ${order.userId}`);
+        throw new ForbiddenException('You are not authorized to confirm this payment');
+      }
+    } catch (error) {
+      if (!(error instanceof ForbiddenException)) {
+        this.logger.error(`Error verifying order ownership: ${error.message}`);
+      }
+      throw error;
+    }
+    
+    // Allow confirming payments in PENDING or FAILED state
+    if (payment.status !== PaymentStatus.PENDING && payment.status !== PaymentStatus.FAILED) {
+      this.logger.warn(`Cannot confirm payment ${paymentId} with status ${payment.status}`);
+      throw new BadRequestException(`Cannot confirm payment with status: ${payment.status}`);
+    }
+    
+    try {
+      // Process payment with Stripe
+      const stripeResult = await this.stripeService.confirmPayment(
+        payment.paymentIntentId,
+        confirmPaymentDto.cardDetails
+      );
+      
+      // Update payment status
+      const updatedPayment = await this.prisma.payment.update({
+        where: { id: paymentId },
+        data: {
+          status: PaymentStatus.SUCCEEDED,
+          updatedAt: new Date(),
+        },
+      });
+      
+      // Update order payment status
+      await this.orderService.updatePaymentStatus(
+        payment.orderId,
+        PaymentStatus.SUCCEEDED,
+        payment.paymentIntentId
+      );
+      
+      // Publish payment.processed event
+      await this.rabbitmqService.publishPaymentProcessed(updatedPayment as unknown as Payment);
+      
+      this.logger.log(`Payment ${paymentId} confirmed successfully`);
+      return updatedPayment as unknown as Payment;
+    } catch (error) {
+      this.logger.error(`Error confirming payment ${paymentId}: ${error.message}`);
+      
+      // Check if this is a card error that requires attention
+      const errorMessage = error.message || 'Payment confirmation failed';
+      const isCardError = error.type === 'StripeCardError' || 
+                         errorMessage.toLowerCase().includes('card') || 
+                         errorMessage.toLowerCase().includes('payment method');
+      
+      // Update payment status to FAILED
+      const updatedPayment = await this.prisma.payment.update({
+        where: { id: paymentId },
+        data: {
+          status: PaymentStatus.FAILED,
+          errorMessage: errorMessage,
+          metadata: {
+            ...(payment.metadata as object || {}),
+            lastError: {
+              message: errorMessage,
+              type: error.type || 'unknown',
+              code: error.code || 'unknown',
+              time: new Date().toISOString()
+            }
+          } as Prisma.JsonObject,
+          updatedAt: new Date(),
+        },
+      });
+      
+      // Update order payment status
+      await this.orderService.updatePaymentStatus(
+        payment.orderId,
+        PaymentStatus.FAILED,
+        payment.paymentIntentId
+      );
+      
+      // Publish payment.failed event
+      await this.rabbitmqService.publishPaymentFailed(updatedPayment as unknown as Payment);
+      
+      throw new BadRequestException({
+        message: errorMessage,
+        code: error.code || 'payment_failed',
+        type: error.type || 'card_error',
+        isCardError: isCardError,
+        paymentId: payment.id
+      });
+    }
   }
 } 

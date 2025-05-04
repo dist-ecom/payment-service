@@ -24,6 +24,7 @@ import { Payment } from './entities/payment.entity';
 import { PaymentResponseDto } from './dto/payment-response.dto';
 import { WebhookEventDto } from './dto/payment-webhook.dto';
 import { StripeService } from './services/stripe.service';
+import { ConfirmPaymentDto } from './dto/confirm-payment.dto';
 
 @ApiTags('payments')
 @Controller('payments')
@@ -51,11 +52,28 @@ export class PaymentsController {
     @Body() createPaymentDto: CreatePaymentDto,
     @Request() req,
   ): Promise<PaymentResponseDto> {
-    const payment = await this.paymentsService.createPayment(
-      createPaymentDto,
-      req.user.userId,
-    );
-    return this.mapPaymentToResponseDto(payment);
+    this.logger.log(`Creating payment for order ${createPaymentDto.orderId} with amount ${createPaymentDto.amount}`);
+    
+    // Validate the incoming data
+    if (!createPaymentDto.amount || createPaymentDto.amount <= 0) {
+      this.logger.error('Invalid payment amount provided');
+      throw new Error('Invalid payment amount');
+    }
+    
+    try {
+      // Create payment with the user's ID from JWT token
+      const payment = await this.paymentsService.createPayment(
+        createPaymentDto,
+        req.user.userId,
+      );
+      
+      this.logger.log(`Payment created successfully: ${payment.id}`);
+      
+      return this.mapPaymentToResponseDto(payment);
+    } catch (error) {
+      this.logger.error(`Failed to create payment: ${error.message}`);
+      throw error;
+    }
   }
 
   @Get()
@@ -217,6 +235,45 @@ export class PaymentsController {
   ): Promise<PaymentResponseDto> {
     const payment = await this.paymentsService.checkPaymentStatus(id, req.user.userId);
     return this.mapPaymentToResponseDto(payment);
+  }
+
+  @Get('by-order/:orderId')
+  @UseGuards(JwtAuthGuard)
+  @ApiBearerAuth()
+  @ApiOperation({ summary: 'Get payment by order ID' })
+  @ApiResponse({ 
+    status: 200, 
+    description: 'Payment found',
+    type: PaymentResponseDto 
+  })
+  @ApiResponse({ status: 404, description: 'Payment not found' })
+  async getByOrderId(
+    @Param('orderId') orderId: string,
+    @Request() req,
+  ): Promise<Payment> {
+    this.logger.log(`Getting payment for order ${orderId}`);
+    return this.paymentsService.findByOrderId(orderId, req.user.userId);
+  }
+
+  @Post(':id/confirm')
+  @UseGuards(JwtAuthGuard)
+  @ApiBearerAuth()
+  @ApiOperation({ summary: 'Confirm an existing payment' })
+  @ApiResponse({ 
+    status: 200, 
+    description: 'Payment confirmed successfully',
+    type: PaymentResponseDto
+  })
+  @ApiResponse({ status: 400, description: 'Bad request' })
+  @ApiResponse({ status: 404, description: 'Payment not found' })
+  @HttpCode(HttpStatus.OK)
+  async confirmPayment(
+    @Param('id') id: string,
+    @Body() confirmPaymentDto: ConfirmPaymentDto,
+    @Request() req,
+  ): Promise<Payment> {
+    this.logger.log(`Confirming payment ${id}`);
+    return this.paymentsService.confirmPayment(id, confirmPaymentDto, req.user.userId);
   }
 
   private mapPaymentToResponseDto(payment: Payment): PaymentResponseDto {

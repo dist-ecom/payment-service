@@ -13,6 +13,8 @@ import {
   Headers,
   RawBodyRequest,
   Patch,
+  BadRequestException,
+  Logger,
 } from '@nestjs/common';
 import { PaymentsService } from './payments.service';
 import { CreatePaymentDto } from './dto/create-payment.dto';
@@ -26,6 +28,8 @@ import { StripeService } from './services/stripe.service';
 @ApiTags('payments')
 @Controller('payments')
 export class PaymentsController {
+  private readonly logger = new Logger(PaymentsController.name);
+
   constructor(
     private readonly paymentsService: PaymentsService,
     private readonly stripeService: StripeService,
@@ -151,25 +155,49 @@ export class PaymentsController {
   @HttpCode(HttpStatus.OK)
   @ApiOperation({ summary: 'Handle payment provider webhooks' })
   @ApiResponse({ status: 200, description: 'Webhook processed successfully' })
+  @ApiResponse({ status: 400, description: 'Invalid webhook payload' })
+  @ApiResponse({ status: 401, description: 'Invalid signature' })
   async handleWebhook(
     @Body() eventDto: WebhookEventDto,
     @Headers('stripe-signature') signature: string,
     @Req() request: RawBodyRequest<Request>,
   ): Promise<{ received: boolean }> {
-    // If signature is provided, validate it (Stripe webhook)
-    if (signature) {
-      const payload = request.rawBody;
-      const event = await this.stripeService.constructEventFromPayload(
-        payload,
-        signature,
-      );
-      await this.paymentsService.handleWebhook(event as unknown as WebhookEventDto);
-    } else {
-      // Process webhook without signature validation (for testing)
-      await this.paymentsService.handleWebhook(eventDto);
+    try {
+      // Require signature for production environment
+      if (process.env.NODE_ENV === 'production' && !signature) {
+        this.logger.error('Missing Stripe signature in production environment');
+        return { received: false };
+      }
+
+      // If signature is provided, validate it (Stripe webhook)
+      if (signature) {
+        if (!request.rawBody) {
+          this.logger.error('Missing raw body for Stripe webhook signature verification');
+          return { received: false };
+        }
+        
+        const payload = request.rawBody;
+        try {
+          const event = await this.stripeService.constructEventFromPayload(
+            payload,
+            signature,
+          );
+          await this.paymentsService.handleWebhook(event as unknown as WebhookEventDto);
+        } catch (error) {
+          this.logger.error(`Webhook signature verification failed: ${error.message}`);
+          throw new BadRequestException('Invalid signature');
+        }
+      } else if (process.env.NODE_ENV !== 'production') {
+        // Only allow unsigned webhooks in non-production environments
+        this.logger.warn('Processing unsigned webhook in non-production environment');
+        await this.paymentsService.handleWebhook(eventDto);
+      }
+      
+      return { received: true };
+    } catch (error) {
+      this.logger.error(`Webhook processing error: ${error.message}`, error.stack);
+      throw error;
     }
-    
-    return { received: true };
   }
 
   @Get(':id/status')

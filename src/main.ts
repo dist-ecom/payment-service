@@ -1,5 +1,5 @@
 import { NestFactory } from '@nestjs/core';
-import { ValidationPipe, Logger } from '@nestjs/common';
+import { ValidationPipe, Logger, RequestMethod } from '@nestjs/common';
 import { SwaggerModule, DocumentBuilder } from '@nestjs/swagger';
 import { MicroserviceOptions, Transport } from '@nestjs/microservices';
 import { AppModule } from './app.module';
@@ -9,15 +9,37 @@ import { HttpService } from '@nestjs/axios';
 import { firstValueFrom } from 'rxjs';
 import * as fs from 'fs';
 import * as os from 'os';
+import * as bodyParser from 'body-parser';
+import { NestExpressApplication } from '@nestjs/platform-express';
 
 async function bootstrap() {
-  const app = await NestFactory.create(AppModule, {
+  const app = await NestFactory.create<NestExpressApplication>(AppModule, {
     cors: true,
     logger: ['error', 'warn', 'log', 'debug'],
   });
   
   const logger = new Logger('Bootstrap');
   const configService = app.get(ConfigService);
+  
+  // Configure body parser to handle both JSON and raw bodies for webhooks
+  app.use(
+    bodyParser.json({
+      verify: (req: any, res, buf) => {
+        // Make raw body available for webhook verification
+        if (req.originalUrl === '/payments/webhook' || req.originalUrl.includes('/webhook')) {
+          req.rawBody = buf;
+        }
+      },
+    })
+  );
+  
+  // Configure security headers
+  app.use((req, res, next) => {
+    res.header('X-Content-Type-Options', 'nosniff');
+    res.header('X-Frame-Options', 'DENY');
+    res.header('Strict-Transport-Security', 'max-age=31536000; includeSubDomains');
+    next();
+  });
   
   // Get application config
   const port = configService.get<number>('PORT') || 3003;
@@ -37,10 +59,29 @@ async function bootstrap() {
       },
       noAck: false,
       prefetchCount: 1,
+      // Important: configure for event-based messaging
+      socketOptions: {
+        heartbeatIntervalInSeconds: 5,
+        reconnectTimeInSeconds: 5,
+      },
+      // Handle nested pattern format from order service, but preserve pattern for routing
       deserializer: {
         deserialize: (value) => {
           try {
-            return JSON.parse(value.toString());
+            logger.debug(`Received RMQ message: ${value.toString().substring(0, 100)}...`);
+            const parsedMessage = JSON.parse(value.toString());
+            
+            // If this is already a pattern-wrapped message, return it directly to allow for proper routing
+            // This is how NestJS expects messages to be formatted for routing to EventPattern handlers
+            if (parsedMessage && 
+                typeof parsedMessage === 'object' && 
+                parsedMessage.pattern && 
+                parsedMessage.data) {
+              logger.debug(`Preserving pattern-wrapped message for event: ${parsedMessage.pattern}`);
+              return parsedMessage;
+            }
+            
+            return parsedMessage;
           } catch (e) {
             logger.error(`Failed to deserialize message: ${e.message}`);
             return value.toString();

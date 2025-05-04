@@ -1,9 +1,10 @@
-import { Module, forwardRef } from '@nestjs/common';
+import { Module, forwardRef, OnModuleInit } from '@nestjs/common';
 import { ClientsModule, Transport } from '@nestjs/microservices';
 import { ConfigModule, ConfigService } from '@nestjs/config';
 import { RabbitmqService } from './rabbitmq.service';
 import { OrdersConsumer } from './consumers/orders.consumer';
 import { PaymentsModule } from '../payments/payments.module';
+import { Logger } from '@nestjs/common';
 
 @Module({
   imports: [
@@ -18,6 +19,10 @@ import { PaymentsModule } from '../payments/payments.module';
             queue: 'payments_queue',
             queueOptions: {
               durable: true,
+            },
+            socketOptions: {
+              heartbeatIntervalInSeconds: 5,
+              reconnectTimeInSeconds: 5,
             },
           },
         }),
@@ -34,6 +39,10 @@ import { PaymentsModule } from '../payments/payments.module';
             queueOptions: {
               durable: true,
             },
+            socketOptions: {
+              heartbeatIntervalInSeconds: 5,
+              reconnectTimeInSeconds: 5,
+            },
           },
         }),
         inject: [ConfigService],
@@ -41,11 +50,16 @@ import { PaymentsModule } from '../payments/payments.module';
     ]),
     forwardRef(() => PaymentsModule),
   ],
-  providers: [RabbitmqService, OrdersConsumer],
+  controllers: [OrdersConsumer],
+  providers: [RabbitmqService],
   exports: [RabbitmqService],
 })
-export class RabbitmqModule {
-  constructor(private readonly ordersConsumer: OrdersConsumer) {
-    console.log('RabbitmqModule initialized with OrdersConsumer');
+export class RabbitmqModule implements OnModuleInit {
+  private readonly logger = new Logger(RabbitmqModule.name);
+  
+  constructor() {}
+  
+  onModuleInit() {
+    this.logger.log('RabbitmqModule initialized');
   }
 } 

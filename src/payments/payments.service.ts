@@ -204,6 +204,19 @@ export class PaymentsService {
     // Log the incoming webhook
     this.logger.log(`Received webhook: ${eventDto.type} - ${eventDto.id}`);
 
+    // Check if this webhook was already processed (idempotency)
+    const existingEvent = await this.prisma.webhookEvent.findFirst({
+      where: {
+        eventId: eventDto.id,
+        processed: true,
+      },
+    });
+
+    if (existingEvent) {
+      this.logger.log(`Webhook ${eventDto.id} already processed, skipping`);
+      return;
+    }
+
     // Save webhook event to database first
     const webhookEvent = await this.prisma.webhookEvent.create({
       data: {
@@ -216,11 +229,34 @@ export class PaymentsService {
     });
 
     try {
-      // Process based on event type
-      if (eventDto.type === 'payment_intent.succeeded') {
-        await this.handlePaymentSucceeded(eventDto.data.object);
-      } else if (eventDto.type === 'payment_intent.payment_failed') {
-        await this.handlePaymentFailed(eventDto.data.object);
+      // Process based on event type with exponential backoff retry
+      let retries = 0;
+      const maxRetries = 3;
+      let success = false;
+
+      while (!success && retries < maxRetries) {
+        try {
+          if (eventDto.type === 'payment_intent.succeeded') {
+            await this.handlePaymentSucceeded(eventDto.data.object);
+          } else if (eventDto.type === 'payment_intent.payment_failed') {
+            await this.handlePaymentFailed(eventDto.data.object);
+          } else if (eventDto.type === 'payment_intent.canceled') {
+            await this.handlePaymentCancelled(eventDto.data.object);
+          } else if (eventDto.type === 'charge.refunded') {
+            await this.handlePaymentRefunded(eventDto.data.object);
+          }
+          success = true;
+        } catch (error) {
+          retries++;
+          if (retries >= maxRetries) {
+            throw error; // rethrow if we've exhausted retries
+          }
+          
+          // Exponential backoff
+          const delay = 1000 * Math.pow(2, retries);
+          this.logger.warn(`Retry ${retries}/${maxRetries} for webhook ${eventDto.id} after ${delay}ms`);
+          await new Promise(resolve => setTimeout(resolve, delay));
+        }
       }
 
       // Mark webhook as processed
@@ -258,6 +294,12 @@ export class PaymentsService {
       throw new NotFoundException(`Payment with intent ID ${paymentIntentId} not found`);
     }
 
+    // Verify payment amount matches to prevent tampering
+    if (Math.round(Number(payment.amount) * 100) !== paymentIntent.amount) {
+      this.logger.error(`Payment amount mismatch for ${paymentIntentId}: ${payment.amount} vs ${paymentIntent.amount/100}`);
+      throw new BadRequestException('Payment amount mismatch');
+    }
+
     // Get receipt URL if available - using 'any' type to allow expanded properties
     let receiptUrl = null;
     if (paymentIntent.latest_charge && typeof paymentIntent.latest_charge !== 'string') {
@@ -276,6 +318,7 @@ export class PaymentsService {
       data: {
         status: PaymentStatus.SUCCEEDED,
         receiptUrl,
+        updatedAt: new Date(),
       },
     });
 
@@ -304,12 +347,24 @@ export class PaymentsService {
       throw new NotFoundException(`Payment with intent ID ${paymentIntentId} not found`);
     }
 
-    // Update payment status
+    // Extract detailed error information
+    const errorMessage = paymentIntent.last_payment_error?.message || 'Payment failed';
+    const errorCode = paymentIntent.last_payment_error?.code || '';
+    const errorType = paymentIntent.last_payment_error?.type || '';
+    
+    // Update payment status with detailed error information
     const updatedPayment = await this.prisma.payment.update({
       where: { id: payment.id },
       data: {
         status: PaymentStatus.FAILED,
-        errorMessage: paymentIntent.last_payment_error?.message || 'Payment failed',
+        errorMessage,
+        metadata: {
+          ...(payment.metadata as object || {}),
+          errorCode,
+          errorType,
+          lastPaymentError: paymentIntent.last_payment_error || {}
+        } as Prisma.JsonObject,
+        updatedAt: new Date(),
       },
     });
 
@@ -324,6 +379,80 @@ export class PaymentsService {
     await this.rabbitmqService.publishPaymentFailed(updatedPayment);
 
     this.logger.log(`Payment failed and event published for order ${payment.orderId}`);
+  }
+  
+  private async handlePaymentCancelled(paymentIntent: any): Promise<void> {
+    const paymentIntentId = paymentIntent.id;
+    
+    // Find payment by paymentIntentId
+    const payment = await this.prisma.payment.findFirst({
+      where: { paymentIntentId },
+    });
+
+    if (!payment) {
+      throw new NotFoundException(`Payment with intent ID ${paymentIntentId} not found`);
+    }
+    
+    // Update payment status
+    await this.prisma.payment.update({
+      where: { id: payment.id },
+      data: {
+        status: PaymentStatus.CANCELLED,
+        updatedAt: new Date(),
+      },
+    });
+
+    // Update order payment status
+    await this.orderService.updatePaymentStatus(
+      payment.orderId,
+      PaymentStatus.CANCELLED,
+      paymentIntentId,
+    );
+
+    this.logger.log(`Payment cancelled for order ${payment.orderId}`);
+  }
+  
+  private async handlePaymentRefunded(charge: any): Promise<void> {
+    // Find the payment by charge ID
+    // First need to get the payment intent ID from the charge
+    const paymentIntentId = charge.payment_intent;
+    
+    if (!paymentIntentId) {
+      throw new Error('No payment intent ID found in refund charge');
+    }
+    
+    const payment = await this.prisma.payment.findFirst({
+      where: { paymentIntentId },
+    });
+
+    if (!payment) {
+      throw new NotFoundException(`Payment with intent ID ${paymentIntentId} not found`);
+    }
+    
+    // Update payment status
+    const updatedPayment = await this.prisma.payment.update({
+      where: { id: payment.id },
+      data: {
+        status: PaymentStatus.REFUNDED,
+        metadata: {
+          ...(payment.metadata as object || {}),
+          refundId: charge.refunds?.data?.[0]?.id,
+          refundReason: charge.refunds?.data?.[0]?.reason,
+          refundAmount: charge.refunds?.data?.[0]?.amount,
+          refundDate: new Date().toISOString(),
+        } as Prisma.JsonObject,
+        updatedAt: new Date(),
+      },
+    });
+
+    // Update order payment status
+    await this.orderService.updatePaymentStatus(
+      payment.orderId,
+      PaymentStatus.REFUNDED,
+      paymentIntentId,
+    );
+
+    this.logger.log(`Payment refunded for order ${payment.orderId}`);
   }
 
   async checkPaymentStatus(paymentId: string, userId: string): Promise<Payment> {

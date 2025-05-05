@@ -48,3 +48,5 @@ lerna-debug.log*
 # Misc
 .DS_Store
 Thumbs.db
+
+auth_token.txt

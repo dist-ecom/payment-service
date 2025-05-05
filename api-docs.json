@@ -335,6 +335,7 @@
       "post": {
         "operationId": "PaymentsController_confirmPayment",
         "summary": "Confirm an existing payment",
+        "description": "Confirm a payment using either a Stripe payment method ID or a test token (e.g., tok_visa for test mode)",
         "parameters": [
           {
             "name": "id",
@@ -367,7 +368,7 @@
             }
           },
           "400": {
-            "description": "Bad request"
+            "description": "Bad request - Either payment method ID or token is required"
           },
           "404": {
             "description": "Payment not found"
@@ -380,6 +381,20 @@
           {
             "bearer": []
           }
+        ]
+      }
+    },
+    "/payments/quick-checkout": {
+      "post": {
+        "operationId": "PaymentsController_createQuickCheckout",
+        "parameters": [],
+        "responses": {
+          "201": {
+            "description": ""
+          }
+        },
+        "tags": [
+          "payments"
         ]
       }
     },
@@ -573,49 +588,17 @@
           "data": {
             "type": "object",
             "description": "The event payload"
+          },
+          "provider": {
+            "type": "string",
+            "description": "The payment provider (e.g., stripe)",
+            "example": "stripe"
           }
         },
         "required": [
           "type",
           "id",
           "data"
-        ]
-      },
-      "CardDetailsDto": {
-        "type": "object",
-        "properties": {
-          "number": {
-            "type": "string",
-            "description": "Card number",
-            "example": "4242424242424242"
-          },
-          "expMonth": {
-            "type": "string",
-            "description": "Expiration month",
-            "example": "12"
-          },
-          "expYear": {
-            "type": "string",
-            "description": "Expiration year",
-            "example": "2025"
-          },
-          "cvc": {
-            "type": "string",
-            "description": "CVC/CVV code",
-            "example": "123"
-          },
-          "name": {
-            "type": "string",
-            "description": "Name on card",
-            "example": "John Doe"
-          }
-        },
-        "required": [
-          "number",
-          "expMonth",
-          "expYear",
-          "cvc",
-          "name"
         ]
       },
       "ConfirmPaymentDto": {
@@ -629,18 +612,19 @@
               "card"
             ]
           },
-          "cardDetails": {
-            "description": "Card details for the payment",
-            "allOf": [
-              {
-                "$ref": "#/components/schemas/CardDetailsDto"
-              }
-            ]
+          "paymentMethodId": {
+            "type": "string",
+            "description": "Stripe payment method ID (from client-side tokenization)",
+            "example": "pm_1234567890abcdef"
+          },
+          "token": {
+            "type": "string",
+            "description": "Stripe test token (e.g., tok_visa) for test mode only",
+            "example": "tok_visa"
           }
         },
         "required": [
-          "paymentMethod",
-          "cardDetails"
+          "paymentMethod"
         ]
       }
     }

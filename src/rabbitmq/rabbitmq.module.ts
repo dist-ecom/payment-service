@@ -16,7 +16,7 @@ import { Logger } from '@nestjs/common';
           transport: Transport.RMQ,
           options: {
             urls: [configService.get<string>('RABBITMQ_URL') || 'amqp://localhost:5672'],
-            queue: 'payments_queue',
+            queue: 'payment_events_queue',
             queueOptions: {
               durable: true,
             },

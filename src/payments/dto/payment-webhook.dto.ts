@@ -1,5 +1,5 @@
 import { ApiProperty } from '@nestjs/swagger';
-import { IsString, IsNotEmpty, IsObject } from 'class-validator';
+import { IsString, IsNotEmpty, IsObject, IsOptional } from 'class-validator';
 
 export class WebhookEventDto {
   @ApiProperty({
@@ -27,4 +27,13 @@ export class WebhookEventDto {
   data: {
     object: Record<string, any>;
   };
+  
+  @ApiProperty({
+    description: 'The payment provider (e.g., stripe)',
+    example: 'stripe',
+    required: false,
+  })
+  @IsOptional()
+  @IsString()
+  provider?: string;
 } 

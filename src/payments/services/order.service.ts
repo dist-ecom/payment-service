@@ -11,6 +11,7 @@ interface OrderDetails {
   totalAmount: number;
   status: string;
   paymentStatus: string;
+  paymentMethod?: string;
 }
 
 @Injectable()

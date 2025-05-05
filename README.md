@@ -24,6 +24,7 @@ A microservice for handling payment processing in the e-commerce platform, with 
   - [Testing](#testing)
     - [Unit and Integration Tests](#unit-and-integration-tests)
     - [Manual Testing with Stripe Test Cards](#manual-testing-with-stripe-test-cards)
+    - [Using Stripe Test Tokens](#using-stripe-test-tokens)
     - [Testing Flow](#testing-flow)
   - [Deployment](#deployment)
     - [Using Docker](#using-docker)
@@ -248,9 +249,44 @@ Use these test card numbers with any future expiration date, CVC, and postal cod
 | 4242 4242 4242 4242 | Successful payment |
 | 4000 0025 0000 3155 | Requires authentication (3D Secure) |
 | 4000 0000 0000 0002 | Payment declined |
-| 4000 0000 0000 9995 | Insufficient funds |
-| 4000 0000 0000 9987 | Lost card |
-| 4000 0000 0000 9979 | Stolen card |
+
+### Using Stripe Test Tokens
+
+For testing in environments where you cannot use the Stripe.js library to create payment method IDs, you can use Stripe's test tokens:
+
+1. First, create a payment:
+```bash
+curl -X POST http://localhost:3003/payments \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer YOUR_JWT_TOKEN" \
+  -d '{
+    "orderId": "your_order_id",
+    "amount": 100,
+    "currency": "USD",
+    "paymentMethod": "card"
+  }'
+```
+
+2. Then confirm the payment using a test token:
+```bash
+curl -X POST http://localhost:3003/payments/PAYMENT_ID/confirm \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer YOUR_JWT_TOKEN" \
+  -d '{
+    "paymentMethod": "card",
+    "token": "tok_visa"
+  }'
+```
+
+Available test tokens:
+| Token | Description |
+|-------|-------------|
+| tok_visa | Successful Visa card payment |
+| tok_visa_debit | Visa debit card |
+| tok_mastercard | Mastercard payment |
+| tok_amex | American Express |
+| tok_discover | Discover card |
+| tok_visa_chargeDeclined | Card that will be declined |
 
 ### Testing Flow
 

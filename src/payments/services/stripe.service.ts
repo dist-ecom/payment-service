@@ -239,10 +239,11 @@ export class StripeService {
     }
   }
 
-  async confirmPayment(
+  async confirmPaymentWithCard(
     paymentIntentId: string,
-    cardDetails: any
-  ): Promise<{ clientSecret: string; paymentIntentId: string }> {
+    paymentMethodId?: string,
+    token?: string
+  ): Promise<any> {
     try {
       this.logger.log(`Confirming Stripe payment intent ${paymentIntentId}`);
       
@@ -250,8 +251,8 @@ export class StripeService {
         throw new BadRequestException('Payment intent ID is required');
       }
       
-      if (!cardDetails) {
-        throw new BadRequestException('Card details are required');
+      if (!paymentMethodId && !token) {
+        throw new BadRequestException('Either payment method ID or token is required');
       }
       
       // First check the current status of the payment intent
@@ -267,118 +268,120 @@ export class StripeService {
         return {
           clientSecret: currentPaymentIntent.client_secret,
           paymentIntentId: currentPaymentIntent.id,
+          status: currentPaymentIntent.status
         };
       }
       
-      // If it requires cancellation, cancel it and create a new one
-      if (['canceled', 'requires_payment_method'].includes(currentPaymentIntent.status)) {
-        this.logger.log(`Payment intent ${paymentIntentId} requires a new payment method, recreating`);
+      try {
+        // Create confirmation options based on whether we have a token or payment method ID
+        const confirmOptions: any = {
+          return_url: 'http://localhost:3100/payment-success',
+        };
         
-        try {
-          // Cancel the existing payment intent if not already canceled
-          if (currentPaymentIntent.status !== 'canceled') {
-            await this.stripe.paymentIntents.cancel(paymentIntentId);
-          }
-        } catch (cancelError) {
-          // Log but continue if we can't cancel
-          this.logger.warn(`Could not cancel payment intent ${paymentIntentId}: ${cancelError.message}`);
-        }
-      }
-      
-      // For test cards, handle specially to ensure success
-      if (cardDetails.number === '4242424242424242') {
-        this.logger.log(`Test card detected for payment ${paymentIntentId}, ensuring success`);
-        
-        // First create a payment method
-        const paymentMethod = await this.stripe.paymentMethods.create({
-          type: 'card',
-          card: {
-            number: cardDetails.number,
-            exp_month: parseInt(cardDetails.expMonth, 10),
-            exp_year: parseInt(cardDetails.expYear, 10),
-            cvc: cardDetails.cvc,
-          },
-        });
-        
-        // If the payment intent is in a state that can be confirmed, do it
-        if (['requires_confirmation', 'requires_action', 'requires_payment_method'].includes(currentPaymentIntent.status)) {
-          try {
-            // Attach the payment method to the customer if there is one
-            if (currentPaymentIntent.customer) {
-              await this.stripe.paymentMethods.attach(paymentMethod.id, {
-                customer: currentPaymentIntent.customer as string,
-              });
-            }
-            
-            // Then confirm the payment intent with the payment method
-            const confirmation = await this.stripe.paymentIntents.confirm(
-              paymentIntentId,
-              {
-                payment_method: paymentMethod.id,
-                return_url: 'http://localhost:3100/payment-success', // Needed for 3D Secure
-              }
-            );
-            
-            this.logger.log(`Test payment intent ${paymentIntentId} confirmed successfully`);
-            
-            return {
-              clientSecret: confirmation.client_secret,
-              paymentIntentId: confirmation.id,
-            };
-          } catch (confirmError) {
-            this.logger.error(`Error confirming test payment intent: ${confirmError.message}`);
-            
-            // If the payment intent is in a bad state, we might need to recreate it
-            if (confirmError.message.includes('canceled') || 
-                confirmError.message.includes('cannot be confirmed again')) {
-              throw new BadRequestException({
-                message: 'Payment intent cannot be confirmed in its current state. Please create a new payment.',
-                code: 'payment_intent_invalid_state',
-                status: currentPaymentIntent.status
-              });
-            }
-            
-            throw confirmError;
-          }
-        } else {
-          // For other states, return the current payment intent
-          this.logger.log(`Payment intent ${paymentIntentId} is in state ${currentPaymentIntent.status}, cannot confirm directly`);
-          return {
-            clientSecret: currentPaymentIntent.client_secret,
-            paymentIntentId: currentPaymentIntent.id,
+        // Use either the payment method ID or test token
+        if (token) {
+          confirmOptions.payment_method_data = {
+            type: 'card',
+            card: { token },
           };
+          this.logger.log(`Using token for confirmation: ${token}`);
+        } else if (paymentMethodId) {
+          confirmOptions.payment_method = paymentMethodId;
+          this.logger.log(`Using payment method ID for confirmation: ${paymentMethodId}`);
         }
+        
+        // Then confirm the payment intent with the payment method or token
+        try {
+          const confirmation = await this.stripe.paymentIntents.confirm(
+            paymentIntentId,
+            confirmOptions
+          );
+          
+          this.logger.log(`Payment intent ${paymentIntentId} confirmed successfully with status: ${confirmation.status}`);
+          
+          return {
+            clientSecret: confirmation.client_secret,
+            paymentIntentId: confirmation.id,
+            status: confirmation.status
+          };
+        } catch (confirmError) {
+          this.logger.error(`Error confirming payment intent: ${confirmError.message}`);
+          
+          // If the payment intent can't be confirmed in its current state, try updating the payment method first
+          if (confirmError.message.includes('cannot be confirmed again') || 
+              confirmError.message.includes('Payment intent cannot be confirmed in its current state')) {
+            
+            // Try attaching a payment method first
+            const paymentMethodData: any = token 
+              ? { type: 'card', card: { token } }
+              : { payment_method: paymentMethodId };
+            
+            this.logger.log(`Attempting to update payment method for intent ${paymentIntentId}`);
+            
+            // For test tokens, create a new payment method first
+            if (token) {
+              try {
+                const paymentMethod = await this.stripe.paymentMethods.create({
+                  type: 'card',
+                  card: { token },
+                });
+                
+                this.logger.log(`Created new payment method ${paymentMethod.id} from token`);
+                
+                // Attach the payment method to the payment intent
+                await this.stripe.paymentIntents.update(paymentIntentId, {
+                  payment_method: paymentMethod.id,
+                });
+                
+                // Try confirming again with the new payment method
+                const reconfirmation = await this.stripe.paymentIntents.confirm(
+                  paymentIntentId,
+                  { payment_method: paymentMethod.id }
+                );
+                
+                this.logger.log(`Payment intent ${paymentIntentId} confirmed successfully after payment method update`);
+                
+                return {
+                  clientSecret: reconfirmation.client_secret,
+                  paymentIntentId: reconfirmation.id,
+                  status: reconfirmation.status
+                };
+              } catch (pmError) {
+                this.logger.error(`Error creating/attaching payment method: ${pmError.message}`);
+                throw pmError;
+              }
+            }
+          }
+          
+          throw confirmError;
+        }
+      } catch (error) {
+        // If we get an error that suggests the payment intent is in a bad state,
+        // try to create a new one and cancel the old one
+        if (error.message.includes('canceled') || 
+            error.message.includes('Payment intent cannot be confirmed in its current state')) {
+          
+          this.logger.log(`Payment intent ${paymentIntentId} is in a bad state. Trying to cancel it.`);
+          
+          try {
+            // Try to cancel the payment intent if it's not already canceled
+            if (currentPaymentIntent.status !== 'canceled') {
+              await this.stripe.paymentIntents.cancel(paymentIntentId);
+              this.logger.log(`Successfully canceled payment intent ${paymentIntentId}`);
+            }
+          } catch (cancelError) {
+            this.logger.warn(`Could not cancel payment intent ${paymentIntentId}: ${cancelError.message}`);
+          }
+          
+          throw new BadRequestException({
+            message: 'Unable to confirm payment. Please create a new payment and try again.',
+            code: 'payment_intent_invalid_state',
+            status: currentPaymentIntent.status
+          });
+        }
+        
+        throw error;
       }
-      
-      // For real cards, first create a payment method
-      const paymentMethod = await this.stripe.paymentMethods.create({
-        type: 'card',
-        card: {
-          number: cardDetails.number,
-          exp_month: parseInt(cardDetails.expMonth, 10),
-          exp_year: parseInt(cardDetails.expYear, 10),
-          cvc: cardDetails.cvc,
-        },
-        billing_details: {
-          name: cardDetails.name || 'Customer',
-        },
-      });
-      
-      // Then confirm using the payment method
-      const paymentIntent = await this.stripe.paymentIntents.confirm(
-        paymentIntentId,
-        {
-          payment_method: paymentMethod.id,
-          return_url: 'http://localhost:3100/payment-success', // Needed for 3D Secure
-        }
-      );
-      
-      this.logger.log(`Payment intent ${paymentIntentId} confirmed successfully with status ${paymentIntent.status}`);
-      
-      return {
-        clientSecret: paymentIntent.client_secret,
-        paymentIntentId: paymentIntent.id,
-      };
     } catch (error) {
       this.logger.error(`Error confirming payment intent ${paymentIntentId}: ${error.message}`);
       
@@ -401,6 +404,76 @@ export class StripeService {
       throw new BadRequestException(
         error.message || 'Error confirming payment'
       );
+    }
+  }
+
+  // Add a simpler checkout session method that uses Stripe Checkout directly
+  async createCheckoutSession(params: {
+    orderId: string;
+    userId: string;
+    customerEmail?: string;
+    items: Array<{
+      name: string;
+      description?: string;
+      price: number;
+      quantity: number;
+      images?: string[];
+      productId: string;
+    }>;
+    successUrl: string;
+    cancelUrl: string;
+    metadata?: Record<string, any>;
+    currency?: string;
+  }): Promise<{ url: string; sessionId: string }> {
+    try {
+      const currency = params.currency?.toLowerCase() || 'usd';
+      
+      // Format line items for Stripe checkout
+      const lineItems = params.items.map(item => ({
+        price_data: {
+          currency: currency,
+          product_data: {
+            name: item.name,
+            description: item.description,
+            images: item.images,
+            metadata: { 
+              productId: item.productId 
+            },
+          },
+          unit_amount: Math.round(item.price * 100), // Convert to cents
+        },
+        quantity: item.quantity,
+      }));
+
+      // Create Stripe checkout session
+      const session = await this.stripe.checkout.sessions.create({
+        payment_method_types: ['card'],
+        mode: 'payment',
+        success_url: params.successUrl,
+        cancel_url: params.cancelUrl,
+        customer_email: params.customerEmail,
+        line_items: lineItems,
+        metadata: {
+          orderId: params.orderId,
+          userId: params.userId,
+          ...params.metadata,
+        },
+        shipping_address_collection: {
+          allowed_countries: ['US', 'CA', 'GB', 'AU', 'DE', 'FR', 'ES', 'IT'],
+        },
+        allow_promotion_codes: true,
+        billing_address_collection: 'auto',
+      });
+
+      this.logger.log(`Created Stripe checkout session: ${session.id} for order: ${params.orderId}`);
+      
+      return {
+        url: session.url,
+        sessionId: session.id
+      };
+    } catch (error) {
+      this.logger.error(`Error creating checkout session: ${error.message}`, error.stack);
+      throw new BadRequestException(`Checkout session creation failed: ${error.message}`);
     }
   }
 } 

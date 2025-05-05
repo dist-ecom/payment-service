@@ -15,11 +15,15 @@ import {
   Patch,
   BadRequestException,
   Logger,
+  Query,
+  UnauthorizedException,
 } from '@nestjs/common';
 import { PaymentsService } from './payments.service';
 import { CreatePaymentDto } from './dto/create-payment.dto';
 import { ApiBearerAuth, ApiOperation, ApiResponse, ApiTags } from '@nestjs/swagger';
 import { JwtAuthGuard } from '../auth/guards/jwt-auth.guard';
+import { JwtOptionalAuthGuard } from '../auth/guards/jwt-optional-auth.guard';
+import { GetUser } from '../auth/decorators/get-user.decorator';
 import { Payment } from './entities/payment.entity';
 import { PaymentResponseDto } from './dto/payment-response.dto';
 import { WebhookEventDto } from './dto/payment-webhook.dto';
@@ -258,13 +262,16 @@ export class PaymentsController {
   @Post(':id/confirm')
   @UseGuards(JwtAuthGuard)
   @ApiBearerAuth()
-  @ApiOperation({ summary: 'Confirm an existing payment' })
+  @ApiOperation({ 
+    summary: 'Confirm an existing payment',
+    description: 'Confirm a payment using either a Stripe payment method ID or a test token (e.g., tok_visa for test mode)'
+  })
   @ApiResponse({ 
     status: 200, 
     description: 'Payment confirmed successfully',
     type: PaymentResponseDto
   })
-  @ApiResponse({ status: 400, description: 'Bad request' })
+  @ApiResponse({ status: 400, description: 'Bad request - Either payment method ID or token is required' })
   @ApiResponse({ status: 404, description: 'Payment not found' })
   @HttpCode(HttpStatus.OK)
   async confirmPayment(
@@ -274,6 +281,31 @@ export class PaymentsController {
   ): Promise<Payment> {
     this.logger.log(`Confirming payment ${id}`);
     return this.paymentsService.confirmPayment(id, confirmPaymentDto, req.user.userId);
+  }
+
+  @Post('quick-checkout')
+  @UseGuards(JwtAuthGuard)
+  async createQuickCheckout(
+    @Body() checkoutDto: {
+      orderId: string;
+      items: Array<{
+        name: string;
+        description?: string;
+        price: number;
+        quantity: number;
+        images?: string[];
+        productId: string;
+      }>;
+      successUrl: string;
+      cancelUrl: string;
+      customerEmail?: string;
+      currency?: string;
+      metadata?: Record<string, any>;
+    },
+    @Req() req,
+  ) {
+    // This endpoint simplifies the checkout process by redirecting directly to Stripe
+    return this.paymentsService.createQuickCheckout(checkoutDto, req.user.userId);
   }
 
   private mapPaymentToResponseDto(payment: Payment): PaymentResponseDto {

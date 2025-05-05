@@ -1,33 +1,5 @@
 import { ApiProperty } from '@nestjs/swagger';
-import { IsEnum, IsNotEmpty, IsObject, IsOptional, IsString, ValidateNested } from 'class-validator';
-import { Type } from 'class-transformer';
-
-export class CardDetailsDto {
-  @ApiProperty({ description: 'Card number', example: '4242424242424242' })
-  @IsString()
-  @IsNotEmpty()
-  number: string;
-
-  @ApiProperty({ description: 'Expiration month', example: '12' })
-  @IsString()
-  @IsNotEmpty()
-  expMonth: string;
-
-  @ApiProperty({ description: 'Expiration year', example: '2025' })
-  @IsString()
-  @IsNotEmpty()
-  expYear: string;
-
-  @ApiProperty({ description: 'CVC/CVV code', example: '123' })
-  @IsString()
-  @IsNotEmpty()
-  cvc: string;
-
-  @ApiProperty({ description: 'Name on card', example: 'John Doe' })
-  @IsString()
-  @IsNotEmpty()
-  name: string;
-}
+import { IsEnum, IsNotEmpty, IsOptional, IsString } from 'class-validator';
 
 export class ConfirmPaymentDto {
   @ApiProperty({ description: 'Payment method', example: 'card', enum: ['card'] })
@@ -36,11 +8,20 @@ export class ConfirmPaymentDto {
   paymentMethod: string;
 
   @ApiProperty({ 
-    description: 'Card details for the payment',
-    type: CardDetailsDto
+    description: 'Stripe payment method ID (from client-side tokenization)',
+    example: 'pm_1234567890abcdef',
+    required: false
   })
-  @IsObject()
-  @ValidateNested()
-  @Type(() => CardDetailsDto)
-  cardDetails: CardDetailsDto;
+  @IsString()
+  @IsOptional()
+  paymentMethodId?: string;
+  
+  @ApiProperty({ 
+    description: 'Stripe test token (e.g., tok_visa) for test mode only',
+    example: 'tok_visa',
+    required: false
+  })
+  @IsString()
+  @IsOptional()
+  token?: string;
 } 

@@ -96,7 +96,7 @@ async function bootstrap() {
     transport: Transport.RMQ,
     options: {
       urls: [rabbitmqUrl],
-      queue: 'payments_queue',
+      queue: 'payment_events_queue',
       queueOptions: {
         durable: true,
       },
@@ -107,7 +107,7 @@ async function bootstrap() {
 
   // Start microservices
   await app.startAllMicroservices();
-  logger.log('Microservice is listening on queues: orders_queue, payments_queue');
+  logger.log('Microservice is listening on queues: orders_queue, payment_events_queue');
 
   // Enable global validation
   app.useGlobalPipes(new ValidationPipe({
@@ -125,7 +125,7 @@ async function bootstrap() {
     .build();
   
   const document = SwaggerModule.createDocument(app, config);
-  SwaggerModule.setup('/api', app, document);
+  SwaggerModule.setup('api', app, document);
   
   // Save Swagger JSON to file for external documentation
   fs.writeFileSync('./api-docs.json', JSON.stringify(document, null, 2));
@@ -167,6 +167,9 @@ async function bootstrap() {
       // Use IP address for local development, hostname for production
       const serviceAddress = process.env.NODE_ENV === 'production' ? hostname : ipAddress;
       
+      // Use host.docker.internal for health checks to allow Docker to reach host services
+      const healthCheckAddress = 'host.docker.internal';
+      
       // Create service ID (same format that worked in our test)
       const serviceId = `${serviceName}-${hostname}-${port}`;
       
@@ -177,7 +180,7 @@ async function bootstrap() {
         Address: serviceAddress,
         Port: Number(port),
         Check: {
-          HTTP: `http://${serviceAddress}:${port}/health`,
+          HTTP: `http://${healthCheckAddress}:${port}/health`,
           Interval: '15s'
         },
         Tags: ['api', 'payment-service', 'nestjs'],
@@ -188,7 +191,7 @@ async function bootstrap() {
       
       logger.log(`Registering service with Consul at: ${serviceRegistryUrl}`);
       logger.log(`Using service ID: ${serviceId}`);
-      logger.log(`Address: ${serviceAddress}, Port: ${port}`);
+      logger.log(`Service address: ${serviceAddress}, Health check address: ${healthCheckAddress}, Port: ${port}`);
       
       try {
         // First verify Consul is reachable

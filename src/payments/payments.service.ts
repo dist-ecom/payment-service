@@ -1,4 +1,4 @@
-import { Injectable, Logger, NotFoundException, BadRequestException, ConflictException, Inject, forwardRef, ForbiddenException, InternalServerErrorException } from '@nestjs/common';
+import { Injectable, Logger, NotFoundException, BadRequestException, ConflictException, Inject, forwardRef, ForbiddenException, InternalServerErrorException, UnprocessableEntityException } from '@nestjs/common';
 import { PrismaService } from '../prisma/prisma.service';
 import { CreatePaymentDto } from './dto/create-payment.dto';
 import { PaymentStatus, PaymentProvider, Payment, WebhookEvent, Prisma } from '@prisma/client';
@@ -29,6 +29,19 @@ export class PaymentsService {
     this.logger.log(`Creating payment for order ${createPaymentDto.orderId} with amount ${createPaymentDto.amount}`);
     
     try {
+      // Validate currency
+      const supportedCurrencies = ['USD', 'EUR', 'GBP', 'CAD', 'AUD', 'JPY'];
+      const currency = createPaymentDto.currency || 'USD';
+      
+      if (!supportedCurrencies.includes(currency)) {
+        throw new BadRequestException(`Unsupported currency: ${currency}. Supported currencies: ${supportedCurrencies.join(', ')}`);
+      }
+      
+      // Validate payment amount
+      if (createPaymentDto.amount <= 0) {
+        throw new BadRequestException('Payment amount must be greater than zero');
+      }
+      
       // Check if payment already exists for this order
       const existingPayment = await this.prisma.payment.findFirst({
         where: { orderId: createPaymentDto.orderId },
@@ -70,7 +83,7 @@ export class PaymentsService {
         }
       }
 
-      // Get order details to verify ownership
+      // Get order details to verify ownership and amount
       const order = await this.orderService.getOrderDetails(createPaymentDto.orderId);
       
       if (!order) {
@@ -81,6 +94,17 @@ export class PaymentsService {
       if (order.userId !== userId) {
         this.logger.error(`User ${userId} does not own order ${createPaymentDto.orderId}`);
         throw new ForbiddenException('You do not have permission to pay for this order');
+      }
+      
+      // Verify order is in a state that can be paid
+      if (order.status !== 'pending') {
+        throw new BadRequestException(`Cannot process payment for order with status: ${order.status}`);
+      }
+      
+      // Verify payment amount matches order total
+      if (Math.abs(order.totalAmount - createPaymentDto.amount) > 0.01) {
+        this.logger.error(`Payment amount mismatch: ${createPaymentDto.amount} vs order total ${order.totalAmount}`);
+        throw new BadRequestException(`Payment amount (${createPaymentDto.amount}) does not match order total (${order.totalAmount})`);
       }
 
       let clientSecret;
@@ -102,18 +126,27 @@ export class PaymentsService {
         // Create a payment intent with Stripe
         this.logger.log('Creating Stripe payment intent');
         try {
+          // Prepare metadata for Stripe
+          const metadata = {
+            orderId: createPaymentDto.orderId,
+            userId,
+            ...createPaymentDto.metadata || {}
+          };
+          
+          // Create the payment intent
           const result = await this.stripeService.createPaymentIntent(
             createPaymentDto.amount,
-            createPaymentDto.currency || 'USD',
+            currency,
             createPaymentDto.orderId,
-            { userId }
+            metadata
           );
+          
           clientSecret = result.clientSecret;
           paymentIntentId = result.paymentIntentId;
           this.logger.debug(`Stripe payment intent created: ${paymentIntentId}`);
         } catch (stripeError) {
           this.logger.error(`Stripe payment intent creation failed: ${stripeError.message}`, stripeError.stack);
-          throw new BadRequestException(`Payment processing error: ${stripeError.message}`);
+          throw new UnprocessableEntityException(`Payment processing error: ${stripeError.message}`);
         }
       }
 
@@ -123,14 +156,21 @@ export class PaymentsService {
           orderId: createPaymentDto.orderId,
           userId,
           amount: createPaymentDto.amount,
-          currency: createPaymentDto.currency || 'USD',
+          currency,
           status: PaymentStatus.PENDING,
           provider: createPaymentDto.provider || PaymentProvider.STRIPE,
           paymentMethod: createPaymentDto.paymentMethod,
           description: createPaymentDto.description || `Payment for order ${createPaymentDto.orderId}`,
           clientSecret,
-          paymentIntentId, // Use the correct field name from the schema
-          metadata: createPaymentDto.metadata || {},
+          paymentIntentId,
+          metadata: {
+            orderDetails: {
+              totalAmount: order.totalAmount,
+              paymentMethod: order.paymentMethod,
+              status: order.status
+            },
+            ...createPaymentDto.metadata || {}
+          } as Prisma.JsonObject,
         },
       });
 
@@ -142,6 +182,9 @@ export class PaymentsService {
         PaymentStatus.PENDING,
         payment.paymentIntentId
       );
+      
+      // Publish payment created event
+      await this.rabbitmqService.publishPaymentProcessed(payment);
 
       return payment;
     } catch (error) {
@@ -149,7 +192,8 @@ export class PaymentsService {
       if (error instanceof ConflictException || 
           error instanceof NotFoundException || 
           error instanceof ForbiddenException ||
-          error instanceof BadRequestException) {
+          error instanceof BadRequestException ||
+          error instanceof UnprocessableEntityException) {
         throw error;
       }
       throw new InternalServerErrorException(`Payment processing failed: ${error.message}`);
@@ -158,7 +202,10 @@ export class PaymentsService {
 
   async findAll(userId?: string): Promise<Payment[]> {
     const where = userId ? { userId } : {};
-    return this.prisma.payment.findMany({ where });
+    return this.prisma.payment.findMany({ 
+      where,
+      orderBy: { createdAt: 'desc' }
+    });
   }
 
   async findOne(id: string, userId?: string): Promise<Payment> {
@@ -192,552 +239,687 @@ export class PaymentsService {
   }
 
   async cancelPayment(paymentId: string, userId: string): Promise<Payment> {
-    const payment = await this.findOne(paymentId, userId);
-
-    if (
-      payment.status !== PaymentStatus.PENDING &&
-      payment.status !== PaymentStatus.PROCESSING
-    ) {
-      throw new BadRequestException('Only pending or processing payments can be cancelled');
-    }
-
+    this.logger.log(`Cancelling payment ${paymentId} for user ${userId}`);
+    
     try {
+      const payment = await this.findOne(paymentId, userId);
+  
+      if (payment.status !== PaymentStatus.PENDING &&
+          payment.status !== PaymentStatus.PROCESSING) {
+        throw new BadRequestException('Only pending or processing payments can be cancelled');
+      }
+  
       // Cancel payment with provider
       if (payment.provider === PaymentProvider.STRIPE && payment.paymentIntentId) {
         await this.stripeService.cancelPaymentIntent(payment.paymentIntentId);
       }
-
+  
       // Update payment status in database
       const updatedPayment = await this.prisma.payment.update({
         where: { id: paymentId },
         data: {
           status: PaymentStatus.CANCELLED,
+          updatedAt: new Date(),
         },
       });
-
+  
       // Update order payment status
       await this.orderService.updatePaymentStatus(
         payment.orderId,
         PaymentStatus.CANCELLED,
         payment.paymentIntentId,
       );
-
+      
+      // Publish payment cancelled event
+      await this.rabbitmqService.publishPaymentFailed(updatedPayment);
+      
+      this.logger.log(`Payment ${paymentId} cancelled successfully`);
+  
       return updatedPayment;
     } catch (error) {
       this.logger.error(`Error cancelling payment: ${error.message}`, error.stack);
-      throw error;
+      if (error instanceof NotFoundException || error instanceof BadRequestException) {
+        throw error;
+      }
+      throw new InternalServerErrorException(`Failed to cancel payment: ${error.message}`);
     }
   }
 
   async refundPayment(paymentId: string, userId: string): Promise<Payment> {
-    const payment = await this.findOne(paymentId, userId);
-
-    if (payment.status !== PaymentStatus.SUCCEEDED) {
-      throw new BadRequestException('Only successful payments can be refunded');
-    }
-
+    this.logger.log(`Refunding payment ${paymentId} for user ${userId}`);
+    
     try {
+      const payment = await this.findOne(paymentId, userId);
+  
+      if (payment.status !== PaymentStatus.SUCCEEDED) {
+        throw new BadRequestException('Only successful payments can be refunded');
+      }
+  
       // Process refund with provider
       if (payment.provider === PaymentProvider.STRIPE && payment.paymentIntentId) {
         await this.stripeService.refundPayment(payment.paymentIntentId);
       }
-
+  
       // Update payment status
       const updatedPayment = await this.prisma.payment.update({
         where: { id: paymentId },
         data: {
           status: PaymentStatus.REFUNDED,
+          updatedAt: new Date(),
         },
       });
-
+  
       // Update order payment status
       await this.orderService.updatePaymentStatus(
         payment.orderId,
         PaymentStatus.REFUNDED,
         payment.paymentIntentId,
       );
-
+      
+      // Publish payment refunded event
+      await this.rabbitmqService.publishPaymentFailed(updatedPayment);
+      
+      this.logger.log(`Payment ${paymentId} refunded successfully`);
+  
       return updatedPayment;
     } catch (error) {
       this.logger.error(`Error refunding payment: ${error.message}`, error.stack);
+      if (error instanceof NotFoundException || error instanceof BadRequestException) {
+        throw error;
+      }
+      throw new InternalServerErrorException(`Failed to refund payment: ${error.message}`);
+    }
+  }
+
+  /**
+   * Handle webhook events from payment providers
+   */
+  async handleWebhook(event: WebhookEventDto): Promise<void> {
+    this.logger.log(`Processing webhook event: ${event.type}`);
+    
+    try {
+      // Handle different event types
+      switch (event.type) {
+        case 'payment_intent.succeeded':
+          await this.handlePaymentIntentSucceeded(event.data.object);
+          break;
+        
+        case 'payment_intent.payment_failed':
+          await this.handlePaymentIntentFailed(event.data.object);
+          break;
+        
+        case 'charge.refunded':
+          await this.handleChargeRefunded(event.data.object);
+          break;
+        
+        default:
+          this.logger.log(`Unhandled webhook event type: ${event.type}`);
+      }
+    } catch (error) {
+      this.logger.error(`Error processing webhook event: ${error.message}`, error.stack);
       throw error;
     }
   }
 
-  async handleWebhook(eventDto: WebhookEventDto): Promise<void> {
-    // Log the incoming webhook
-    this.logger.log(`Received webhook: ${eventDto.type} - ${eventDto.id}`);
-
-    // Check if this webhook was already processed (idempotency)
-    const existingEvent = await this.prisma.webhookEvent.findFirst({
-      where: {
-        eventId: eventDto.id,
-        processed: true,
-      },
-    });
-
-    if (existingEvent) {
-      this.logger.log(`Webhook ${eventDto.id} already processed, skipping`);
-      return;
-    }
-
-    // Save webhook event to database first
-    const webhookEvent = await this.prisma.webhookEvent.create({
-      data: {
-        provider: 'stripe',
-        eventType: eventDto.type,
-        eventId: eventDto.id,
-        payload: eventDto as unknown as Prisma.JsonObject,
-        processed: false,
-      },
-    });
-
+  /**
+   * Handle payment_intent.succeeded event
+   */
+  private async handlePaymentIntentSucceeded(paymentIntent: any): Promise<void> {
+    this.logger.log(`Processing payment_intent.succeeded for ${paymentIntent.id}`);
+    
     try {
-      // Process based on event type with exponential backoff retry
-      let retries = 0;
-      const maxRetries = 3;
-      let success = false;
-
-      while (!success && retries < maxRetries) {
-        try {
-          if (eventDto.type === 'payment_intent.succeeded') {
-            await this.handlePaymentSucceeded(eventDto.data.object);
-          } else if (eventDto.type === 'payment_intent.payment_failed') {
-            await this.handlePaymentFailed(eventDto.data.object);
-          } else if (eventDto.type === 'payment_intent.canceled') {
-            await this.handlePaymentCancelled(eventDto.data.object);
-          } else if (eventDto.type === 'charge.refunded') {
-            await this.handlePaymentRefunded(eventDto.data.object);
-          }
-          success = true;
-        } catch (error) {
-          retries++;
-          if (retries >= maxRetries) {
-            throw error; // rethrow if we've exhausted retries
-          }
-          
-          // Exponential backoff
-          const delay = 1000 * Math.pow(2, retries);
-          this.logger.warn(`Retry ${retries}/${maxRetries} for webhook ${eventDto.id} after ${delay}ms`);
-          await new Promise(resolve => setTimeout(resolve, delay));
-        }
+      // Extract metadata
+      const { orderId } = paymentIntent.metadata || {};
+      
+      if (!orderId) {
+        this.logger.error(`Payment intent ${paymentIntent.id} does not have an orderId in metadata`);
+        return;
       }
-
-      // Mark webhook as processed
-      await this.prisma.webhookEvent.update({
-        where: { id: webhookEvent.id },
-        data: {
-          processed: true,
-          processedAt: new Date(),
-        },
-      });
-    } catch (error) {
-      // Log error and update webhook event with error
-      this.logger.error(`Error processing webhook: ${error.message}`, error.stack);
-      await this.prisma.webhookEvent.update({
-        where: { id: webhookEvent.id },
-        data: {
-          processingErrors: error.message,
-        },
+      
+      // Check if we already have a payment record for this intent
+      const existingPayment = await this.prisma.payment.findFirst({
+        where: { paymentIntentId: paymentIntent.id }
       });
       
-      // Rethrow error
+      if (existingPayment) {
+        // Update existing payment record if status not already succeeded
+        if (existingPayment.status !== PaymentStatus.SUCCEEDED) {
+          await this.prisma.payment.update({
+            where: { id: existingPayment.id },
+            data: {
+              status: PaymentStatus.SUCCEEDED,
+              updatedAt: new Date(),
+              receiptUrl: paymentIntent.charges?.data[0]?.receipt_url,
+            }
+          });
+          
+          this.logger.log(`Updated payment ${existingPayment.id} to SUCCEEDED status`);
+        }
+      } else {
+        // Create new payment record
+        // Get the amount from the payment intent (in cents)
+        const amount = paymentIntent.amount / 100;
+        const currency = paymentIntent.currency;
+        
+        // We need to find the user ID associated with this order
+        // This would typically be done by querying the order service
+        let userId = paymentIntent.metadata.userId;
+        
+        if (!userId) {
+          try {
+            // Try to get order details from order service
+            const orderDetails = await this.orderService.getOrderDetails(orderId);
+            userId = orderDetails.userId;
+          } catch (error) {
+            this.logger.error(`Could not get user ID for order ${orderId}: ${error.message}`);
+            // Fallback to a default system user ID or null 
+            userId = null;
+          }
+        }
+        
+        // Create payment record
+        const payment = await this.prisma.payment.create({
+          data: {
+            orderId,
+            userId,
+            amount,
+            currency,
+            paymentIntentId: paymentIntent.id,
+            paymentMethod: paymentIntent.payment_method,
+            status: PaymentStatus.SUCCEEDED,
+            provider: PaymentProvider.STRIPE,
+            receiptUrl: paymentIntent.charges?.data[0]?.receipt_url,
+            description: `Payment for order ${orderId}`,
+            metadata: paymentIntent.metadata,
+          }
+        });
+        
+        this.logger.log(`Created new payment record: ${payment.id}`);
+      }
+      
+      // Notify order service about successful payment
+      try {
+        await this.orderService.updatePaymentStatus(
+          orderId,
+          PaymentStatus.SUCCEEDED,
+          paymentIntent.id
+        );
+        this.logger.log(`Updated order ${orderId} payment status to PAID`);
+      } catch (error) {
+        this.logger.error(`Failed to update order payment status: ${error.message}`, error.stack);
+        // We don't want to fail the webhook processing if this call fails
+        // Consider implementing a retry mechanism or queue
+      }
+      
+    } catch (error) {
+      this.logger.error(`Error processing payment intent succeeded: ${error.message}`, error.stack);
       throw error;
     }
   }
 
-  private async handlePaymentSucceeded(paymentIntent: any): Promise<void> {
-    const paymentIntentId = paymentIntent.id;
+  /**
+   * Handle payment_intent.payment_failed event
+   */
+  private async handlePaymentIntentFailed(paymentIntent: any): Promise<void> {
+    this.logger.log(`Processing payment_intent.payment_failed for ${paymentIntent.id}`);
     
-    // Find payment by paymentIntentId
-    const payment = await this.prisma.payment.findFirst({
-      where: { paymentIntentId },
-    });
-
-    if (!payment) {
-      throw new NotFoundException(`Payment with intent ID ${paymentIntentId} not found`);
+    try {
+      // Extract metadata
+      const { orderId } = paymentIntent.metadata || {};
+      
+      if (!orderId) {
+        this.logger.error(`Payment intent ${paymentIntent.id} does not have an orderId in metadata`);
+        return;
+      }
+      
+      // Check if we have a payment record for this intent
+      const existingPayment = await this.prisma.payment.findFirst({
+        where: { paymentIntentId: paymentIntent.id }
+      });
+      
+      if (existingPayment) {
+        // Update existing payment record
+        await this.prisma.payment.update({
+          where: { id: existingPayment.id },
+          data: {
+            status: PaymentStatus.FAILED,
+            updatedAt: new Date(),
+            errorMessage: paymentIntent.last_payment_error?.message,
+          }
+        });
+        
+        this.logger.log(`Updated payment ${existingPayment.id} to FAILED status`);
+      }
+      
+      // Notify order service about failed payment
+      try {
+        await this.orderService.updatePaymentStatus(
+          orderId,
+          PaymentStatus.FAILED,
+          paymentIntent.id
+        );
+        this.logger.log(`Updated order ${orderId} payment status to FAILED`);
+      } catch (error) {
+        this.logger.error(`Failed to update order payment status: ${error.message}`, error.stack);
+      }
+      
+    } catch (error) {
+      this.logger.error(`Error processing payment intent failed: ${error.message}`, error.stack);
+      throw error;
     }
-
-    // Verify payment amount matches to prevent tampering
-    if (Math.round(Number(payment.amount) * 100) !== paymentIntent.amount) {
-      this.logger.error(`Payment amount mismatch for ${paymentIntentId}: ${payment.amount} vs ${paymentIntent.amount/100}`);
-      throw new BadRequestException('Payment amount mismatch');
-    }
-
-    // Get receipt URL if available - using 'any' type to allow expanded properties
-    let receiptUrl = null;
-    if (paymentIntent.latest_charge && typeof paymentIntent.latest_charge !== 'string') {
-      receiptUrl = paymentIntent.latest_charge.receipt_url;
-    } else if (
-      paymentIntent.charges && 
-      paymentIntent.charges.data && 
-      paymentIntent.charges.data.length > 0
-    ) {
-      receiptUrl = paymentIntent.charges.data[0].receipt_url;
-    }
-
-    // Update payment status
-    const updatedPayment = await this.prisma.payment.update({
-      where: { id: payment.id },
-      data: {
-        status: PaymentStatus.SUCCEEDED,
-        receiptUrl,
-        updatedAt: new Date(),
-      },
-    });
-
-    // Update order payment status
-    await this.orderService.updatePaymentStatus(
-      payment.orderId,
-      PaymentStatus.SUCCEEDED,
-      paymentIntentId,
-    );
-
-    // Publish payment.processed event
-    await this.rabbitmqService.publishPaymentProcessed(updatedPayment);
-
-    this.logger.log(`Payment succeeded and event published for order ${payment.orderId}`);
   }
 
-  private async handlePaymentFailed(paymentIntent: any): Promise<void> {
-    const paymentIntentId = paymentIntent.id;
+  /**
+   * Handle charge.refunded event
+   */
+  private async handleChargeRefunded(charge: any): Promise<void> {
+    this.logger.log(`Processing charge.refunded for ${charge.id}`);
     
-    // Find payment by paymentIntentId
-    const payment = await this.prisma.payment.findFirst({
-      where: { paymentIntentId },
-    });
-
-    if (!payment) {
-      throw new NotFoundException(`Payment with intent ID ${paymentIntentId} not found`);
+    try {
+      // Get the payment intent ID from the charge
+      const paymentIntentId = charge.payment_intent;
+      
+      if (!paymentIntentId) {
+        this.logger.error(`Charge ${charge.id} does not have a payment_intent`);
+        return;
+      }
+      
+      // Find the payment record by payment intent ID
+      const payment = await this.prisma.payment.findFirst({
+        where: { paymentIntentId }
+      });
+      
+      if (!payment) {
+        this.logger.error(`No payment record found for payment intent ${paymentIntentId}`);
+        return;
+      }
+      
+      // Update payment status to refunded
+      await this.prisma.payment.update({
+        where: { id: payment.id },
+        data: {
+          status: PaymentStatus.REFUNDED,
+          updatedAt: new Date(),
+          metadata: {
+            refundId: charge.id,
+            refundAmount: charge.amount_refunded / 100,
+            refundDate: new Date().toISOString()
+          } as any,
+        }
+      });
+      
+      this.logger.log(`Updated payment ${payment.id} to REFUNDED status`);
+      
+      // Notify order service about refund
+      try {
+        await this.orderService.updatePaymentStatus(
+          payment.orderId,
+          PaymentStatus.REFUNDED,
+          paymentIntentId
+        );
+        this.logger.log(`Updated order ${payment.orderId} payment status to REFUNDED`);
+      } catch (error) {
+        this.logger.error(`Failed to update order payment status: ${error.message}`, error.stack);
+      }
+      
+    } catch (error) {
+      this.logger.error(`Error processing charge refunded: ${error.message}`, error.stack);
+      throw error;
     }
-
-    // Extract detailed error information
-    const errorMessage = paymentIntent.last_payment_error?.message || 'Payment failed';
-    const errorCode = paymentIntent.last_payment_error?.code || '';
-    const errorType = paymentIntent.last_payment_error?.type || '';
-    
-    // Update payment status with detailed error information
-    const updatedPayment = await this.prisma.payment.update({
-      where: { id: payment.id },
-      data: {
-        status: PaymentStatus.FAILED,
-        errorMessage,
-        metadata: {
-          ...(payment.metadata as object || {}),
-          errorCode,
-          errorType,
-          lastPaymentError: paymentIntent.last_payment_error || {}
-        } as Prisma.JsonObject,
-        updatedAt: new Date(),
-      },
-    });
-
-    // Update order payment status
-    await this.orderService.updatePaymentStatus(
-      payment.orderId,
-      PaymentStatus.FAILED,
-      paymentIntentId,
-    );
-
-    // Publish payment.failed event
-    await this.rabbitmqService.publishPaymentFailed(updatedPayment);
-
-    this.logger.log(`Payment failed and event published for order ${payment.orderId}`);
-  }
-  
-  private async handlePaymentCancelled(paymentIntent: any): Promise<void> {
-    const paymentIntentId = paymentIntent.id;
-    
-    // Find payment by paymentIntentId
-    const payment = await this.prisma.payment.findFirst({
-      where: { paymentIntentId },
-    });
-
-    if (!payment) {
-      throw new NotFoundException(`Payment with intent ID ${paymentIntentId} not found`);
-    }
-    
-    // Update payment status
-    await this.prisma.payment.update({
-      where: { id: payment.id },
-      data: {
-        status: PaymentStatus.CANCELLED,
-        updatedAt: new Date(),
-      },
-    });
-
-    // Update order payment status
-    await this.orderService.updatePaymentStatus(
-      payment.orderId,
-      PaymentStatus.CANCELLED,
-      paymentIntentId,
-    );
-
-    this.logger.log(`Payment cancelled for order ${payment.orderId}`);
-  }
-  
-  private async handlePaymentRefunded(charge: any): Promise<void> {
-    // Find the payment by charge ID
-    // First need to get the payment intent ID from the charge
-    const paymentIntentId = charge.payment_intent;
-    
-    if (!paymentIntentId) {
-      throw new Error('No payment intent ID found in refund charge');
-    }
-    
-    const payment = await this.prisma.payment.findFirst({
-      where: { paymentIntentId },
-    });
-
-    if (!payment) {
-      throw new NotFoundException(`Payment with intent ID ${paymentIntentId} not found`);
-    }
-    
-    // Update payment status
-    const updatedPayment = await this.prisma.payment.update({
-      where: { id: payment.id },
-      data: {
-        status: PaymentStatus.REFUNDED,
-        metadata: {
-          ...(payment.metadata as object || {}),
-          refundId: charge.refunds?.data?.[0]?.id,
-          refundReason: charge.refunds?.data?.[0]?.reason,
-          refundAmount: charge.refunds?.data?.[0]?.amount,
-          refundDate: new Date().toISOString(),
-        } as Prisma.JsonObject,
-        updatedAt: new Date(),
-      },
-    });
-
-    // Update order payment status
-    await this.orderService.updatePaymentStatus(
-      payment.orderId,
-      PaymentStatus.REFUNDED,
-      paymentIntentId,
-    );
-
-    this.logger.log(`Payment refunded for order ${payment.orderId}`);
   }
 
   async checkPaymentStatus(paymentId: string, userId: string): Promise<Payment> {
-    const payment = await this.findOne(paymentId, userId);
-
-    // If payment is already in a final state, return it
-    if (
-      payment.status === PaymentStatus.SUCCEEDED ||
-      payment.status === PaymentStatus.FAILED ||
-      payment.status === PaymentStatus.REFUNDED ||
-      payment.status === PaymentStatus.CANCELLED
-    ) {
-      return payment;
-    }
-
-    // If using Stripe, check the payment status with Stripe
-    if (payment.provider === PaymentProvider.STRIPE && payment.paymentIntentId) {
-      try {
-        // We use 'any' type here because the Stripe types don't include expanded properties
-        const paymentIntent = await this.stripeService.retrievePaymentIntent(payment.paymentIntentId) as any;
+    try {
+      const payment = await this.findOne(paymentId, userId);
+      
+      // If payment is already in a final state, just return it
+      const finalStates = [
+        PaymentStatus.SUCCEEDED,
+        PaymentStatus.FAILED,
+        PaymentStatus.CANCELLED,
+        PaymentStatus.REFUNDED
+      ];
+      
+      if (finalStates.includes(payment.status as any)) {
+        return payment;
+      }
+      
+      // Only check with provider if we're using a real payment provider
+      if (payment.provider === PaymentProvider.STRIPE && 
+          payment.paymentIntentId && 
+          !payment.paymentIntentId.startsWith('mock_')) {
+          
+        // Get latest status from Stripe
+        const paymentIntent = await this.stripeService.retrievePaymentIntent(payment.paymentIntentId);
         
-        // Map Stripe status to our status
-        const status = this.stripeService.mapStripeStatusToPaymentStatus(paymentIntent.status);
+        // Map Stripe status to our internal status
+        let updatedStatus = payment.status;
         
-        // If status has changed, update it
-        if (status !== payment.status) {
-          // Get receipt URL if available - using 'any' type to allow expanded properties
-          let receiptUrl = null;
-          if (paymentIntent.latest_charge && typeof paymentIntent.latest_charge !== 'string') {
-            receiptUrl = paymentIntent.latest_charge.receipt_url;
-          } else if (
-            paymentIntent.charges && 
-            paymentIntent.charges.data && 
-            paymentIntent.charges.data.length > 0
-          ) {
-            receiptUrl = paymentIntent.charges.data[0].receipt_url;
-          }
-
+        switch(paymentIntent.status) {
+          case 'succeeded':
+            updatedStatus = PaymentStatus.SUCCEEDED;
+            break;
+          case 'canceled':
+            updatedStatus = PaymentStatus.CANCELLED;
+            break;
+          case 'requires_payment_method':
+          case 'requires_confirmation':
+          case 'requires_action':
+          case 'processing':
+            // These are all variations of "in progress" - keep as PENDING
+            updatedStatus = PaymentStatus.PENDING;
+            break;
+          default:
+            // If we don't recognize the status, leave it unchanged
+            this.logger.warn(`Unrecognized Stripe payment status: ${paymentIntent.status}`);
+        }
+        
+        // If status has changed, update our record
+        if (updatedStatus !== payment.status) {
           const updatedPayment = await this.prisma.payment.update({
-            where: { id: paymentId },
+            where: { id: payment.id },
             data: {
-              status,
-              receiptUrl,
-              errorMessage: paymentIntent.last_payment_error?.message,
+              status: updatedStatus,
+              updatedAt: new Date(),
             },
           });
-
+          
           // Update order payment status if needed
-          if (status === PaymentStatus.SUCCEEDED || status === PaymentStatus.FAILED) {
+          if (updatedStatus === PaymentStatus.SUCCEEDED) {
             await this.orderService.updatePaymentStatus(
               payment.orderId,
-              status,
+              PaymentStatus.SUCCEEDED,
               payment.paymentIntentId,
             );
             
-            // Publish appropriate event based on status
-            if (status === PaymentStatus.SUCCEEDED) {
-              await this.rabbitmqService.publishPaymentProcessed(updatedPayment);
-              this.logger.log(`Payment succeeded and event published for order ${payment.orderId}`);
-            } else if (status === PaymentStatus.FAILED) {
-              await this.rabbitmqService.publishPaymentFailed(updatedPayment);
-              this.logger.log(`Payment failed and event published for order ${payment.orderId}`);
-            }
+            // Publish payment.processed event
+            await this.rabbitmqService.publishPaymentProcessed(updatedPayment);
+          } else if (updatedStatus === PaymentStatus.CANCELLED) {
+            await this.orderService.updatePaymentStatus(
+              payment.orderId,
+              PaymentStatus.CANCELLED,
+              payment.paymentIntentId,
+            );
           }
-
+          
           return updatedPayment;
         }
-      } catch (error) {
-        this.logger.error(`Error checking payment status: ${error.message}`, error.stack);
-        // Don't throw error, return current payment status
       }
+      
+      // If no changes or not using a real provider, return the original payment
+      return payment;
+    } catch (error) {
+      this.logger.error(`Error checking payment status: ${error.message}`, error.stack);
+      if (error instanceof NotFoundException) {
+        throw error;
+      }
+      throw new InternalServerErrorException(`Failed to check payment status: ${error.message}`);
     }
-
-    return payment;
   }
 
   async findByOrderId(orderId: string, userId: string): Promise<Payment> {
-    this.logger.log(`Finding payment for order ${orderId}`);
-    
-    const payment = await this.prisma.payment.findFirst({
-      where: { 
-        orderId: orderId 
-      },
-    });
-    
-    if (!payment) {
-      this.logger.warn(`Payment not found for order ${orderId}`);
-      throw new NotFoundException(`Payment not found for order ${orderId}`);
-    }
-    
-    // Get order details to verify ownership
     try {
-      const order = await this.orderService.getOrderDetails(orderId);
-      
-      // Check if user is the owner of the order
-      if (order && order.userId !== userId) {
-        this.logger.warn(`User ${userId} attempted to access payment for order ${orderId} owned by ${order.userId}`);
-        throw new ForbiddenException('You are not authorized to access this payment');
-      }
-    } catch (error) {
-      if (!(error instanceof ForbiddenException)) {
-        this.logger.error(`Error verifying order ownership: ${error.message}`);
-      }
-      throw error;
-    }
-    
-    return payment as unknown as Payment;
-  }
+      const payment = await this.prisma.payment.findFirst({
+        where: {
+          orderId,
+          userId,
+        },
+      });
   
+      if (!payment) {
+        throw new NotFoundException(`Payment for order ${orderId} not found`);
+      }
+  
+      // Check if payment needs status updating (for pending payments)
+      if (payment.status === PaymentStatus.PENDING || payment.status === PaymentStatus.PROCESSING) {
+        return this.checkPaymentStatus(payment.id, userId);
+      }
+  
+      return payment;
+    } catch (error) {
+      this.logger.error(`Error finding payment by order ID: ${error.message}`, error.stack);
+      if (error instanceof NotFoundException) {
+        throw error;
+      }
+      throw new InternalServerErrorException(`Failed to retrieve payment information: ${error.message}`);
+    }
+  }
+
   async confirmPayment(
     paymentId: string, 
     confirmPaymentDto: ConfirmPaymentDto, 
     userId: string
   ): Promise<Payment> {
-    this.logger.log(`Confirming payment ${paymentId}`);
+    this.logger.log(`Confirming payment ${paymentId} for user ${userId}`);
     
-    // Find the payment
-    const payment = await this.prisma.payment.findUnique({
-      where: { id: paymentId },
+    try {
+      const payment = await this.findOne(paymentId, userId);
+      
+      if (payment.status !== PaymentStatus.PENDING) {
+        throw new BadRequestException(`Cannot confirm payment with status: ${payment.status}`);
+      }
+      
+      // Only confirm real payments, not mock ones
+      if (payment.provider === PaymentProvider.STRIPE && 
+          payment.paymentIntentId && 
+          !payment.paymentIntentId.startsWith('mock_')) {
+          
+        // The DTO now includes either payment_method_id or token
+        const { paymentMethodId, token } = confirmPaymentDto;
+        
+        // Basic validation
+        if (!paymentMethodId && !token) {
+          throw new BadRequestException('Either a payment method ID or a token is required');
+        }
+        
+        try {
+          // Confirm payment with Stripe using payment method ID or token
+          const result = await this.stripeService.confirmPaymentWithCard(
+            payment.paymentIntentId,
+            paymentMethodId,
+            token
+          );
+          
+          // Check if payment succeeded immediately
+          if (result.status === 'succeeded') {
+            // Update payment status to succeeded
+            const updatedPayment = await this.prisma.payment.update({
+              where: { id: payment.id },
+              data: {
+                status: PaymentStatus.SUCCEEDED,
+                updatedAt: new Date(),
+              },
+            });
+            
+            // Update order payment status
+            await this.orderService.updatePaymentStatus(
+              payment.orderId,
+              PaymentStatus.SUCCEEDED,
+              payment.paymentIntentId,
+            );
+            
+            // Publish payment processed event
+            await this.rabbitmqService.publishPaymentProcessed(updatedPayment);
+            
+            this.logger.log(`Payment ${paymentId} confirmed successfully`);
+            
+            return updatedPayment;
+          } else if (result.status === 'requires_action') {
+            // For 3D Secure or other additional authentication
+            // In a real implementation, this would be handled by the frontend
+            return await this.updatePaymentStatusFromStripe(payment, payment.paymentIntentId);
+          } else {
+            // Update payment status to reflect current state
+            return this.checkPaymentStatus(paymentId, userId);
+          }
+        } catch (stripeError) {
+          this.logger.error(`Stripe payment confirmation failed: ${stripeError.message}`, stripeError.stack);
+          
+          // Update payment status to failed
+          const updatedPayment = await this.prisma.payment.update({
+            where: { id: payment.id },
+            data: {
+              status: PaymentStatus.FAILED,
+              errorMessage: stripeError.message,
+              metadata: {
+                ...(payment.metadata as object || {}),
+                errorDetails: stripeError.message
+              } as Prisma.JsonObject,
+              updatedAt: new Date(),
+            },
+          });
+          
+          // Update order payment status
+          await this.orderService.updatePaymentStatus(
+            payment.orderId,
+            PaymentStatus.FAILED,
+            payment.paymentIntentId,
+          );
+          
+          throw new UnprocessableEntityException(`Payment confirmation failed: ${stripeError.message}`);
+        }
+      } else if (payment.paymentIntentId?.startsWith('mock_')) {
+        // For mock payments, simulate success
+        this.logger.log(`Processing mock payment ${paymentId}`);
+        
+        // Update payment status to succeeded
+        const updatedPayment = await this.prisma.payment.update({
+          where: { id: payment.id },
+          data: {
+            status: PaymentStatus.SUCCEEDED,
+            receiptUrl: `https://example.com/receipt/${payment.paymentIntentId}`,
+            updatedAt: new Date(),
+          },
+        });
+        
+        // Update order payment status
+        await this.orderService.updatePaymentStatus(
+          payment.orderId,
+          PaymentStatus.SUCCEEDED,
+          payment.paymentIntentId,
+        );
+        
+        // Publish payment processed event
+        await this.rabbitmqService.publishPaymentProcessed(updatedPayment);
+        
+        this.logger.log(`Mock payment ${paymentId} confirmed successfully`);
+        
+        return updatedPayment;
+      } else {
+        throw new BadRequestException('Unable to confirm payment with current provider configuration');
+      }
+    } catch (error) {
+      this.logger.error(`Error confirming payment: ${error.message}`, error.stack);
+      if (error instanceof NotFoundException || 
+          error instanceof BadRequestException || 
+          error instanceof UnprocessableEntityException) {
+        throw error;
+      }
+      throw new InternalServerErrorException(`Failed to confirm payment: ${error.message}`);
+    }
+  }
+
+  // Helper method to update payment status from Stripe
+  private async updatePaymentStatusFromStripe(payment: Payment, paymentIntentId: string): Promise<Payment> {
+    const paymentIntent = await this.stripeService.retrievePaymentIntent(paymentIntentId);
+    const updatedStatus = this.stripeService.mapStripeStatusToPaymentStatus(paymentIntent.status);
+    
+    return await this.prisma.payment.update({
+      where: { id: payment.id },
+      data: {
+        status: updatedStatus,
+        updatedAt: new Date(),
+      },
     });
-    
-    if (!payment) {
-      this.logger.warn(`Payment ${paymentId} not found`);
-      throw new NotFoundException(`Payment ${paymentId} not found`);
-    }
-    
-    // Get order details to verify ownership
-    try {
-      const order = await this.orderService.getOrderDetails(payment.orderId);
-      
-      // Check if user is the owner of the order
-      if (order && order.userId !== userId) {
-        this.logger.warn(`User ${userId} attempted to confirm payment ${paymentId} for order ${payment.orderId} owned by ${order.userId}`);
-        throw new ForbiddenException('You are not authorized to confirm this payment');
-      }
-    } catch (error) {
-      if (!(error instanceof ForbiddenException)) {
-        this.logger.error(`Error verifying order ownership: ${error.message}`);
-      }
-      throw error;
-    }
-    
-    // Allow confirming payments in PENDING or FAILED state
-    if (payment.status !== PaymentStatus.PENDING && payment.status !== PaymentStatus.FAILED) {
-      this.logger.warn(`Cannot confirm payment ${paymentId} with status ${payment.status}`);
-      throw new BadRequestException(`Cannot confirm payment with status: ${payment.status}`);
-    }
+  }
+
+  /**
+   * Create a quick checkout session that redirects directly to Stripe Checkout
+   */
+  async createQuickCheckout(checkoutDto: {
+    orderId: string;
+    items: Array<{
+      name: string;
+      description?: string;
+      price: number;
+      quantity: number;
+      images?: string[];
+      productId: string;
+    }>;
+    successUrl: string;
+    cancelUrl: string;
+    customerEmail?: string;
+    currency?: string;
+    metadata?: Record<string, any>;
+  }, userId: string): Promise<{ checkoutUrl: string; sessionId: string }> {
+    this.logger.log(`Creating quick checkout for order ${checkoutDto.orderId}`);
     
     try {
-      // Process payment with Stripe
-      const stripeResult = await this.stripeService.confirmPayment(
-        payment.paymentIntentId,
-        confirmPaymentDto.cardDetails
-      );
+      // Validate that the order exists
+      const order = await this.orderService.getOrderDetails(checkoutDto.orderId);
       
-      // Update payment status
-      const updatedPayment = await this.prisma.payment.update({
-        where: { id: paymentId },
-        data: {
-          status: PaymentStatus.SUCCEEDED,
-          updatedAt: new Date(),
-        },
+      if (!order) {
+        throw new NotFoundException(`Order ${checkoutDto.orderId} not found`);
+      }
+
+      // Validate user owns the order
+      if (order.userId !== userId) {
+        throw new ForbiddenException('You do not have permission to pay for this order');
+      }
+      
+      // Create Stripe checkout session
+      const session = await this.stripeService.createCheckoutSession({
+        orderId: checkoutDto.orderId,
+        userId,
+        items: checkoutDto.items,
+        successUrl: checkoutDto.successUrl,
+        cancelUrl: checkoutDto.cancelUrl,
+        customerEmail: checkoutDto.customerEmail,
+        currency: checkoutDto.currency,
+        metadata: {
+          ...checkoutDto.metadata,
+          quickCheckout: true,
+        }
       });
-      
-      // Update order payment status
-      await this.orderService.updatePaymentStatus(
-        payment.orderId,
-        PaymentStatus.SUCCEEDED,
-        payment.paymentIntentId
-      );
-      
-      // Publish payment.processed event
-      await this.rabbitmqService.publishPaymentProcessed(updatedPayment as unknown as Payment);
-      
-      this.logger.log(`Payment ${paymentId} confirmed successfully`);
-      return updatedPayment as unknown as Payment;
-    } catch (error) {
-      this.logger.error(`Error confirming payment ${paymentId}: ${error.message}`);
-      
-      // Check if this is a card error that requires attention
-      const errorMessage = error.message || 'Payment confirmation failed';
-      const isCardError = error.type === 'StripeCardError' || 
-                         errorMessage.toLowerCase().includes('card') || 
-                         errorMessage.toLowerCase().includes('payment method');
-      
-      // Update payment status to FAILED
-      const updatedPayment = await this.prisma.payment.update({
-        where: { id: paymentId },
+
+      // Record the checkout initiation
+      await this.prisma.payment.create({
         data: {
-          status: PaymentStatus.FAILED,
-          errorMessage: errorMessage,
+          orderId: checkoutDto.orderId,
+          userId,
+          amount: order.totalAmount,
+          currency: checkoutDto.currency || 'USD',
+          status: PaymentStatus.PENDING,
+          provider: PaymentProvider.STRIPE,
+          paymentMethod: 'card',
+          description: `Quick checkout for order ${checkoutDto.orderId}`,
+          paymentIntentId: session.sessionId,
           metadata: {
-            ...(payment.metadata as object || {}),
-            lastError: {
-              message: errorMessage,
-              type: error.type || 'unknown',
-              code: error.code || 'unknown',
-              time: new Date().toISOString()
-            }
+            stripeCheckoutSession: session.sessionId,
+            quickCheckout: true,
           } as Prisma.JsonObject,
-          updatedAt: new Date(),
-        },
+        }
       });
-      
-      // Update order payment status
+
+      // Update order status
       await this.orderService.updatePaymentStatus(
-        payment.orderId,
-        PaymentStatus.FAILED,
-        payment.paymentIntentId
+        checkoutDto.orderId,
+        PaymentStatus.PENDING,
+        session.sessionId
       );
-      
-      // Publish payment.failed event
-      await this.rabbitmqService.publishPaymentFailed(updatedPayment as unknown as Payment);
-      
-      throw new BadRequestException({
-        message: errorMessage,
-        code: error.code || 'payment_failed',
-        type: error.type || 'card_error',
-        isCardError: isCardError,
-        paymentId: payment.id
-      });
+
+      return {
+        checkoutUrl: session.url,
+        sessionId: session.sessionId
+      };
+    } catch (error) {
+      this.logger.error(`Failed to create quick checkout: ${error.message}`, error.stack);
+      if (error instanceof NotFoundException || 
+          error instanceof ForbiddenException || 
+          error instanceof BadRequestException) {
+        throw error;
+      }
+      throw new InternalServerErrorException(`Failed to create checkout: ${error.message}`);
     }
   }
 } 
